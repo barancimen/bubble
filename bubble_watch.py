@@ -636,17 +636,23 @@ def cap_round_robin(lists, limit):
     return picked
 
 
+@functools.lru_cache(maxsize=None)
+def check_model(task):
+    """Raises if deepseek-flash no longer points at the model this script was checked against."""
+    models = {m["id"]: m.get("name") for m in deepseek("/models")["data"]}
+    if models.get(DEEPSEEK_MODEL) != DEEPSEEK_MODEL_NAME:
+        raise RuntimeError(
+            f"{DEEPSEEK_MODEL} is now {models.get(DEEPSEEK_MODEL) or 'not offered'}, not "
+            f"{DEEPSEEK_MODEL_NAME}, so {task} is paused. Change DEEPSEEK_MODEL_NAME in "
+            "the script to accept the new model.")
+
+
 def classify(sections):
     """One DeepSeek call that groups and judges every new headline.
     `sections` is [(feed id, [(story id, story)], [new headline])].
     Returns ({id: (verdict, label, reason)} for new stories, {id: reference} for
     same-event lines, tokens used)."""
-    models = {m["id"]: m.get("name") for m in deepseek("/models")["data"]}
-    if models.get(DEEPSEEK_MODEL) != DEEPSEEK_MODEL_NAME:
-        raise RuntimeError(
-            f"{DEEPSEEK_MODEL} is now {models.get(DEEPSEEK_MODEL) or 'not offered'}, not "
-            f"{DEEPSEEK_MODEL_NAME}, so classification is paused. Change DEEPSEEK_MODEL_NAME in "
-            "the script to accept the new model.")
+    check_model("classification")
     parts = []
     for fid, known_stories, new in sections:
         text = f"## {FEEDS[fid][1]}\nFlag when: {FEEDS[fid][3]}\n\nKnown stories:\n"
@@ -840,18 +846,213 @@ def feed_block(fid):
     return out, crossed, " ".join(detail)
 
 
+# ---------- LIMRA quarterly annuity sales ----------
+#
+# LIMRA has no data feed, but every news release is listed in its sitemap and states the quarter's
+# total in prose, worded differently each time. DeepSeek reads each release once and copies out the
+# figures with the sentence they come from; a figure is used only if that sentence is in the
+# release word for word and contains the exact total and change. Releases are remembered in
+# LIMRA_STORE, so each is read once.
+
+LIMRA_SITEMAP = "https://www.limra.com/sitemap.xml"
+LIMRA_STORE = os.path.join(HERE, "data", "limra.json")
+LIMRA_YEARS = 3  # releases this many calendar years back are read
+QUARTER_WORDS = {1: "first quarter", 2: "second quarter", 3: "third quarter", 4: "fourth quarter"}
+UP_WORDS = ("increase", "higher", "above", "up", "jump", "rose", "grew", "growth", "gain", "rise")
+DOWN_WORDS = ("decrease", "lower", "below", "down", "fell", "decline", "drop", "slip", "dip")
+STATUS_RANK = {"final": 1, "preliminary": 0}
+
+LIMRA_INSTRUCTIONS = """\
+You extract figures from a LIMRA news release about U.S. annuity sales.
+
+Report every calendar quarter for which the release states TOTAL U.S. annuity sales (all products \
+combined) for that single quarter. Ignore product lines (fixed indexed, RILA, variable, fixed-rate \
+deferred, income annuities and so on), half-year, year-to-date and full-year totals, and forecasts.
+
+For each such quarter output exactly one line:
+QUARTER YYYY-Qn | TOTAL $X billion | CHANGE <change> | EVIDENCE <sentence>
+
+TOTAL is the dollar figure exactly as written in the release. CHANGE is the change from the same \
+quarter one year earlier, copied exactly as written (for example "1% increase", "2% below", \
+"down 12%", "level with"), or NONE if the release doesn't state it. A change against the previous \
+quarter is not a year-over-year change. EVIDENCE is the one sentence that states the total, copied \
+exactly, character for character.
+
+If the release states no single-quarter total, output only: NONE"""
+
+
+def release_text(raw):
+    """Plain text of a LIMRA release page from its dateline on, plus the release date."""
+    s = re.sub(r"(?s)<(script|style).*?</\1>", " ", raw.decode("utf-8", "replace"))
+    t = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", s)).split())
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b", t)
+    released = date(int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else None
+    i = t.find("WINDSOR, Conn.")
+    return (t[i:] if i >= 0 else t)[:15000], released
+
+
+def parse_change(change, evidence):
+    """Signed % change from the CHANGE field, or None unless it is stated unambiguously in the
+    evidence sentence."""
+    if not change or change.upper() == "NONE" or change not in evidence:
+        return None
+    low = change.lower()
+    if re.search(r"\b(level|flat|unchanged)\b", low) and "%" not in low:
+        return 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", low)
+    if not m:
+        return None
+    up = any(re.search(rf"\b{w}", low) for w in UP_WORDS)
+    down = any(re.search(rf"\b{w}", low) for w in DOWN_WORDS)
+    if up == down:
+        return None
+    return float(m.group(1)) * (1 if up else -1)
+
+
+def verify_quarter(line, text, released):
+    """One model line -> {quarter, total, yoy, evidence} if it checks out against the text."""
+    m = re.match(r"\s*(?:[-*•]\s*)?(?:QUARTER\s+)?(20\d\d)-Q([1-4])\s*\|\s*TOTAL\s+\$([\d.,]+)\s*billion\s*\|"
+                 r"\s*CHANGE\s+(.*?)\s*\|\s*EVIDENCE\s+(.+?)\s*$", line)
+    if not m:
+        return None
+    year, q, total_s, change, evidence = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4), m.group(5)
+    evidence = evidence.strip('"“” ')
+    total = float(total_s.replace(",", ""))
+    ok = (evidence in text                                      # copied, not paraphrased
+          and f"${total_s} billion" in evidence                 # the total is in that sentence
+          and QUARTER_WORDS[q] in evidence.lower()              # and so is the quarter
+          and 50 <= total <= 300                                # a market total, not a product line
+          and released is not None and year in (released.year, released.year - 1))
+    if not ok:
+        return None
+    return dict(quarter=f"{year}-Q{q}", total=total, yoy=parse_change(change, evidence), evidence=evidence)
+
+
+def read_release(url):
+    """Fetches one release and extracts its quarterly totals with DeepSeek."""
+    text, released = release_text(fetch(url))
+    # Early figures say "according to preliminary results"; later releases revise them.
+    status = "preliminary" if re.search(r"\bpreliminary results\b", text, re.I) else "final"
+    rec = dict(released=released.isoformat() if released else None, status=status, quarters=[],
+               model=DEEPSEEK_MODEL_NAME)
+    if released is None:
+        return rec
+    check_model("reading LIMRA releases")
+    r = deepseek("/chat/completions", {
+        "model": DEEPSEEK_MODEL, "reasoning_effort": "high", "max_tokens": 16000,
+        "messages": [{"role": "system", "content": LIMRA_INSTRUCTIONS},
+                     {"role": "user", "content": text}]})
+    choice = r["choices"][0]
+    if choice.get("finish_reason") != "stop":
+        raise RuntimeError(f"the model stopped early ({choice.get('finish_reason')})")
+    for line in (choice["message"].get("content") or "").splitlines():
+        if re.search(r"20\d\d-Q[1-4]\s*\|", line):  # the model sometimes drops "QUARTER"
+            q = verify_quarter(line, text, released)
+            if q:
+                rec["quarters"].append(q)
+            else:
+                rec.setdefault("rejected", []).append(line.strip()[:300])
+    return rec
+
+
+def limra_quarters():
+    """({quarter: chosen figure}, [problems]) from every annuity sales release in the window. Per
+    quarter, a final figure beats a preliminary one, then the later release wins."""
+    try:
+        with open(LIMRA_STORE) as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        store = {}
+    problems = []
+    first_year = date.today().year - LIMRA_YEARS
+    xml = fetch(LIMRA_SITEMAP).decode("utf-8", "replace")
+    for url in re.findall(r"<loc>([^<]+)</loc>", xml):
+        low = url.lower()
+        if "/newsroom/news-releases/" not in low or "annuit" not in low or "sales" not in low:
+            continue
+        y = re.search(r"/news-releases/(20\d\d)/", url)
+        if url in store or (y and int(y.group(1)) < first_year):
+            continue
+        try:
+            store[url] = read_release(url)
+        except Exception as e:  # leave it out of the store so the next run tries again
+            problems.append(f"{url}: {e}")
+    os.makedirs(os.path.dirname(LIMRA_STORE), exist_ok=True)
+    with open(LIMRA_STORE, "w") as f:
+        json.dump(store, f, indent=1)
+    best = {}
+    for url, rec in store.items():
+        for q in rec["quarters"]:
+            cand = dict(q, url=url, status=rec["status"], released=rec["released"])
+            key = (STATUS_RANK[rec["status"]], rec["released"] or "")
+            cur = best.get(q["quarter"])
+            if cur is None or key > (STATUS_RANK[cur["status"]], cur["released"] or ""):
+                best[q["quarter"]] = cand
+    for q, v in best.items():  # fill a missing change from the same quarter a year earlier
+        prev = best.get(f"{int(q[:4]) - 1}{q[4:]}")
+        if v["yoy"] is None and prev:
+            v["yoy"], v["computed"] = (v["total"] / prev["total"] - 1) * 100, True
+    return best, problems
+
+
+def next_quarter(q):
+    y, n = int(q[:4]), int(q[-1])
+    return f"{y + n // 4}-Q{n % 4 + 1}"
+
+
+def quarter_end(q):
+    y, n = int(q[:4]), int(q[-1])
+    return date(y + n // 4, n % 4 * 3 + 1, 1) - timedelta(days=1)
+
+
 def block_annuities():
-    out, _, detail = feed_block("F")
-    out += line(
-        "LIMRA's quarterly total annuity sales come in below the same quarter a year earlier, "
-        "two quarters in a row. Annuity sales bring in much of the insurer money that Ares says "
-        "buys the investment-grade AI debt (its first flow). This dashboard does not have LIMRA's "
-        "figures, so this test is manual: compare the last two quarterly totals in LIMRA's releases "
-        "with a year earlier. The stories above are news only; a flagged one means a headline "
-        "reported some decline, which may be a single quarter or one product line, not that the "
-        "test is met.",
-        None, detail)
-    return out + source("LIMRA annuity research", "https://www.limra.com/en/research/annuities/")
+    rule = ("LIMRA's quarterly total U.S. annuity sales come in below the same quarter a year "
+            "earlier, two quarters in a row. Annuity sales bring in much of the insurer money that "
+            "Ares says buys the investment-grade AI debt (its first flow).")
+    try:
+        best, problems = limra_quarters()
+    except Exception as e:
+        best, problems = {}, [f"LIMRA releases unavailable today: {e}"]
+    out = ""
+    quarters = sorted(best)
+    if quarters:
+        rows = []
+        for q in reversed(quarters[-6:]):
+            v = best[q]
+            yoy = ("not stated" if v["yoy"] is None else "0%" if round(v["yoy"]) == 0 else f"{v['yoy']:+.0f}%") + (" (computed)" if v.get("computed") else "")
+            if v["yoy"] is not None and v["yoy"] < 0:
+                yoy = f'<span class="bad">{yoy}</span>'
+            rows.append([f"Q{q[-1]} {q[:4]}", f"${v['total']:,.1f}B", yoy, v["status"],
+                         f'<a href="{esc(v["url"])}">{esc(v["released"])}</a>'])
+        out += table(["Quarter", "Total U.S. annuity sales", "vs. same quarter a year earlier",
+                      "Figures", "LIMRA release"], rows)
+    crossed, detail = None, ""
+    if len(quarters) >= 2:
+        a, b = best[quarters[-2]], best[quarters[-1]]
+        if next_quarter(quarters[-2]) != quarters[-1]:
+            detail = f"{quarters[-2]} and {quarters[-1]} aren't consecutive quarters, so check by hand."
+        elif a["yoy"] is None or b["yoy"] is None:
+            detail = "A year-over-year change is missing for one of the last two quarters."
+        elif (date.today() - quarter_end(quarters[-1])).days > 150:
+            detail = f"The newest figures found are for {quarters[-1]}, which looks out of date."
+        else:
+            crossed = a["yoy"] < 0 and b["yoy"] < 0
+            detail = (f"Last two quarters: {a['yoy']:+.0f}% and {b['yoy']:+.0f}% year over year"
+                      + (" (latest figures preliminary)." if b["status"] == "preliminary" else "."))
+    out += line(rule, crossed, detail)
+    for p in problems:
+        out += f'<p class="error">{esc(p)}</p>'
+    news, _, news_detail = feed_block("F")
+    out += f"<h4>Annuity sales news</h4>{news}"
+    if news_detail:
+        out += f'<p class="muted">{news_detail}</p>'
+    return out + (
+        '<p class="muted">Source: <a href="https://www.limra.com/en/newsroom/news-releases/">LIMRA '
+        "news releases</a>, found through LIMRA's sitemap. "
+        f"{esc(DEEPSEEK_MODEL_NAME)} copies each quarter's total and year-over-year change from the "
+        "release text; a figure is used only if the sentence it quotes appears in the release word "
+        "for word and contains that exact total and quarter. Final figures replace preliminary "
+        "ones. If anything is missing or out of date, the line falls back to checking by hand.</p>")
 
 
 def block_news():
@@ -881,7 +1082,7 @@ SECTIONS = [
         ("Weakest AI borrowers (stock prices)", block_weak_borrowers),
     ]),
     ("3. Insurance money: is the funding still coming in?", [
-        ("Annuity sales news (manual check)", block_annuities),
+        ("Annuity sales", block_annuities),
     ]),
     ("4. Headlines", [
         ("", block_news),
