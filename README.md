@@ -7,7 +7,7 @@ This is a vibe-coded dashboard that tracks signs of distress that portend the po
 - Hourly rental prices for Nvidia H100, H200 and B200 GPUs
 - Corporate bond spreads
 - Stock prices of debt-heavy AI and data-center companies (CoreWeave, IREN, Hut 8, Cipher, TeraWulf, Applied Digital, Oracle)
-- Quarterly U.S. annuity sales, a major source of the insurance money that Ares says is the main lender behind AI debt (read from LIMRA's news releases by deepseek-flash, and used only if each figure matches the release text word for word)
+- Quarterly U.S. annuity sales, a major source of the insurance money that Ares says is the main lender behind AI debt, gathered from LIMRA's news releases by deepseek-flash
 - News about data-center lease cancellations, capex cuts, OpenAI and Anthropic, weak borrowers, credit-rating changes and annuity sales, filtered by deepseek-flash
 
 In addition, the dashboard estimates default probabilities for CoreWeave, Oracle and Nvidia using public credit default swap trade data (code in `cds/`). These estimates are not very accurate. There are instructions for your agent in `cds/CDS_VALIDATION.md` to assess their accuracy. 
