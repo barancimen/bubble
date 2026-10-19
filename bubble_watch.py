@@ -12,12 +12,18 @@ The SEC asks every client to identify itself with a name and contact email,
 so set SEC_USER_AGENT. Headlines are classified by DeepSeek V4.1 Flash; the
 API key is read from DEEPSEEK_API_KEY or .deepseek_api_key next to this
 script. Standard library only; no installs needed.
+
+    python3 bubble_watch.py --cached
+
+rebuilds the page from the responses saved by the last full run, without any network or
+DeepSeek calls: use it to check layout and wording changes in a few seconds.
 """
 import csv
 import functools
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -69,17 +75,40 @@ STORE_DAYS = 90           # forget headlines not seen for this long
 
 
 # ---------- fetching ----------
+# Every full run saves each response in HTTP_CACHE; --cached replays them instead of fetching.
+
+CACHED = "--cached" in sys.argv[1:]
+HTTP_CACHE = os.path.join(HERE, "data", "http_cache")
+FETCHED_AT = os.path.join(HTTP_CACHE, "fetched_at")
+
+
+def _cache_path(url):
+    return os.path.join(HTTP_CACHE, hashlib.sha256(url.encode()).hexdigest())
+
 
 def fetch(url, ua=WEB_UA, tries=3):
+    if CACHED:
+        try:
+            with open(_cache_path(url), "rb") as f:
+                return f.read()
+        except OSError:
+            raise RuntimeError(f"not saved by the last full run: {url}") from None
     req = urllib.request.Request(url, headers={"User-Agent": ua} if ua else {})
     for attempt in range(tries):
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+                body = r.read()
+            break
         except OSError:  # covers URLError, HTTPError and timeouts
             if attempt == tries - 1:
                 raise
             time.sleep(5)
+    os.makedirs(HTTP_CACHE, exist_ok=True)
+    tmp = _cache_path(url) + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, _cache_path(url))
+    return body
 
 
 def fetch_json(url, ua=WEB_UA):
@@ -185,6 +214,8 @@ def news(query):
 
 
 def deepseek(path, payload=None):
+    if CACHED:
+        raise RuntimeError("not called in a --cached run")
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         with open(DEEPSEEK_KEY_FILE) as f:
@@ -245,10 +276,138 @@ def source(text, url):
     return f'<p class="muted">Source: <a href="{esc(url)}">{esc(text)}</a></p>'
 
 
+# ---------- charts ----------
+# Inline SVG, no scripts (the page's security policy blocks them): hover text comes from <title>
+# elements, and every value is also in the table next to the chart.
+
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]  # blue, orange, aqua: validated as a set on white
+INK, MUTED, GRID = "#111", "#52514e", "#e6e5e1"
+CHART_FONT = "font:11px system-ui,sans-serif;display:block"
+
+
+def legend(items):
+    """HTML legend for two or more series: [(name, color)]."""
+    return '<p class="legend">' + "".join(
+        f'<span class="key" style="background:{c}"></span>{esc(n)}' for n, c in items) + "</p>"
+
+
+def nice_ticks(lo, hi, n=4):
+    """Round tick values spanning lo..hi (always including 0 when the range crosses it)."""
+    span = (hi - lo) or abs(hi) or 1
+    raw = span / n
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+    t, ticks = math.floor(lo / step) * step, []
+    while t <= math.ceil(hi / step) * step + step / 1e6:
+        ticks.append(round(t, 10))
+        t += step
+    return ticks
+
+
+def bar_path(x, w, y0, y1, r=4):
+    """A bar from baseline y0 to y1: 4px rounded at the data end, square at the baseline."""
+    r = min(r, abs(y1 - y0), w / 2)
+    if y1 <= y0:  # grows up
+        return (f"M{x:.1f},{y0:.1f}V{y1 + r:.1f}Q{x:.1f},{y1:.1f} {x + r:.1f},{y1:.1f}"
+                f"H{x + w - r:.1f}Q{x + w:.1f},{y1:.1f} {x + w:.1f},{y1 + r:.1f}V{y0:.1f}Z")
+    return (f"M{x:.1f},{y0:.1f}V{y1 - r:.1f}Q{x:.1f},{y1:.1f} {x + r:.1f},{y1:.1f}"
+            f"H{x + w - r:.1f}Q{x + w:.1f},{y1:.1f} {x + w:.1f},{y1 - r:.1f}V{y0:.1f}Z")
+
+
+def short_date(d):
+    """Month and year for axis labels, e.g. "Jun ’26" (an apostrophe so it can't read as a day)."""
+    d = date.fromisoformat(d) if isinstance(d, str) else d
+    return f"{d:%b} ’{d:%y}"
+
+
+def column_chart(cats, series, fmt, domain=None, w=300, h=200, label_last=True, aria=""):
+    """Grouped columns per category on one shared axis, a vertical gridline between quarters and a
+    date under each. series: [(name, color, [value per cat])]. domain=(lo, hi) shares a scale across
+    small multiples. Only the last value of a single series is labeled; the rest are on hover."""
+    vals = [v for _, _, vs in series for v in vs]
+    lo, hi = domain or (min(0, *vals), max(0, *vals))
+    ticks = nice_ticks(lo, hi, n=8)
+    lo, hi = min(lo, ticks[0]), max(hi, ticks[-1])
+    ml, mr, mt, mb = 34, 6, 16, 32
+    pw, ph = w - ml - mr, h - mt - mb
+    y = lambda v: mt + (hi - v) / (hi - lo) * ph
+    band = pw / len(cats)
+    bw = min(24, band * 0.72 / len(series) - 2)
+    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(aria)}" style="{CHART_FONT}">']
+    for t in ticks:
+        out.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="{GRID}"/>')
+        out.append(f'<text x="{ml - 5}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=True)}</text>')
+    for i in range(len(cats) + 1):  # quarter boundaries
+        gx = ml + band * i
+        out.append(f'<line x1="{gx:.1f}" x2="{gx:.1f}" y1="{mt}" y2="{mt + ph}" stroke="{GRID}"/>')
+    out.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y(0):.1f}" y2="{y(0):.1f}" stroke="{MUTED}"/>')
+    group = len(series) * bw + (len(series) - 1) * 2
+    for i, cat in enumerate(cats):
+        x0 = ml + band * i + (band - group) / 2
+        d, cx = date.fromisoformat(cat), ml + band * (i + 0.5)  # month over year, so they fit
+        out.append(f'<text x="{cx:.1f}" y="{h - 18}" text-anchor="middle" fill="{MUTED}">{d:%b}</text>'
+                   f'<text x="{cx:.1f}" y="{h - 5}" text-anchor="middle" fill="{MUTED}">{d:%Y}</text>')
+        for k, (name, color, vs) in enumerate(series):
+            v = vs[i]
+            x = x0 + k * (bw + 2)
+            out.append(f'<path d="{bar_path(x, bw, y(0), y(v))}" fill="{color}"><title>{esc(name)}, quarter ending {esc(cat)}: {fmt(v)}</title></path>')
+            if label_last and i == len(cats) - 1 and len(series) == 1:
+                ty = y(v) - 4 if v >= 0 else y(v) + 12
+                out.append(f'<text x="{x + bw / 2:.1f}" y="{ty:.1f}" text-anchor="middle" fill="{INK}">{fmt(v)}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def line_chart(series, fmt, w=960, h=240, label_every=1, aria=""):
+    """Weekly lines on one axis from zero, with a vertical gridline at each month (labeled every
+    label_every months), an end dot and an end label per line.
+    series: [(name, color, [(ISO date, value)])]. Hover any point for its value."""
+    days = sorted({date.fromisoformat(d) for _, _, pts in series for d, _ in pts})
+    hi = max(v for _, _, pts in series for _, v in pts)
+    ticks = nice_ticks(0, hi, n=8)
+    hi = ticks[-1]
+    ml, mr, mt, mb = 40, 96, 10, 22
+    pw, ph = w - ml - mr, h - mt - mb
+    span = (days[-1] - days[0]).days or 1
+    x = lambda d: ml + (d - days[0]).days / span * pw
+    y = lambda v: mt + (hi - v) / hi * ph
+    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(aria)}" style="{CHART_FONT}">']
+    for t in ticks:
+        out.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="{GRID}"/>')
+        out.append(f'<text x="{ml - 6}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=True)}</text>')
+    m, k = (days[0].replace(day=28) + timedelta(days=4)).replace(day=1), 0  # first month start inside
+    while m <= days[-1]:
+        out.append(f'<line x1="{x(m):.1f}" x2="{x(m):.1f}" y1="{mt}" y2="{mt + ph}" stroke="{GRID}"/>')
+        if k % label_every == 0:
+            out.append(f'<text x="{x(m):.1f}" y="{h - 6}" text-anchor="middle" fill="{MUTED}">{esc(short_date(m))}</text>')
+        m, k = (m.replace(day=28) + timedelta(days=4)).replace(day=1), k + 1
+    for name, color, data in series:
+        pts = " ".join(f"{x(date.fromisoformat(d)):.1f},{y(v):.1f}" for d, v in data)
+        out.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2" '
+                   'stroke-linejoin="round" stroke-linecap="round"/>')
+    for name, color, data in series:  # end dot with a surface ring, label in text ink
+        ex, ey = x(date.fromisoformat(data[-1][0])), y(data[-1][1])
+        out.append(f'<circle cx="{ex:.1f}" cy="{ey:.1f}" r="4" fill="{color}" stroke="#fff" stroke-width="2"/>')
+        out.append(f'<text x="{ex + 9:.1f}" y="{ey + 4:.1f}" fill="{INK}">{esc(name)} {fmt(data[-1][1])}</text>')
+    for name, color, data in series:  # generous invisible hover targets
+        for d, v in data:
+            out.append(f'<circle cx="{x(date.fromisoformat(d)):.1f}" cy="{y(v):.1f}" r="7" fill="transparent">'
+                       f'<title>{esc(name)}, week of {esc(d)}: {fmt(v)}</title></circle>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def money_b(v, tick=False):
+    """$B for charts; ticks drop the decimal."""
+    if tick:
+        return f"{v:,.0f}".replace("-", "−")
+    return f"−{abs(v):,.1f}" if v < 0 else f"{v:,.1f}"
+
+
 # ---------- signal blocks ----------
 
 def block_hyperscalers():
-    rows, fcf_negative, capex_down = [], [], []
+    rows, fcf_negative, capex_down, panels = [], [], [], []
     for ticker, cik, capex_concept in HYPERSCALERS:
         ocf = quarterly_flows(sec_concept(cik, "NetCashProvidedByUsedInOperatingActivities"))
         capex = quarterly_flows(sec_concept(cik, capex_concept))
@@ -261,15 +420,18 @@ def block_hyperscalers():
             fcf_negative.append(ticker)
         if yoy is not None and yoy < 0:
             capex_down.append(ticker)
-        rows.append([
-            ticker, esc(last),
-            " · ".join(billions(v, True) for v in fcf),
-            " · ".join(billions(capex[e]) for e in ends),
-            pct(yoy, True),
-        ])
-    out = table(["Company", "Latest quarter end",
-                 "Free cash flow, last 6 quarters ($B, oldest → newest)",
-                 "Capex, last 6 quarters ($B)", "Latest capex vs same quarter a year earlier"], rows)
+        panels.append((ticker, ends, [capex[e] / 1e9 for e in ends], [v / 1e9 for v in fcf]))
+        rows.append([ticker, esc(last), pct(yoy, True)])
+    domain = (min(min(f) for *_, f in panels), max(max(c) for _, _, c, _ in panels))
+    out = legend([("Capex", SERIES[0]), ("Free cash flow", SERIES[1])])
+    out += ('<p class="muted">Last 6 quarters by quarter-end month, $B, same scale for every '
+            'company. Hover a bar for its exact value.</p><div class="multiples">')
+    out += "".join(
+        f"<div><h5>{t}</h5>" + column_chart(ends, [("Capex", SERIES[0], c), ("Free cash flow", SERIES[1], f)],
+                                           money_b, domain,
+                                           aria=f"{t} capex and free cash flow, last 6 quarters") + "</div>"
+        for t, ends, c, f in panels) + "</div>"
+    out += table(["Company", "Latest quarter end", "Latest capex vs same quarter a year earlier"], rows)
     out += line(
         "any company's quarterly capex is lower than in the same quarter a year earlier. "
         "This is the pull-back Ares names as the trigger. A capex-guidance cut on an earnings "
@@ -289,7 +451,10 @@ def block_nvidia():
     rev = quarterly_flows(sec_concept(NVDA_CIK, "Revenues"))
     ends = list(rev)[-6:]
     change = (rev[ends[-1]] / rev[ends[-2]] - 1) * 100
-    out = table(["Quarter end"] + [esc(e) for e in ends],[["Revenue ($B)"] + [billions(rev[e]) for e in ends]])
+    out = ('<p class="muted">Quarterly revenue by quarter-end month, $B. Hover a bar for its '
+           'exact value.</p><div style="max-width:480px">'
+           + column_chart(ends, [("Revenue", SERIES[0], [rev[e] / 1e9 for e in ends])], money_b,
+                          w=480, h=220, aria="Nvidia quarterly revenue, last 6 quarters") + "</div>")
     out += line("revenue falls from the previous quarter. Nvidia's sales are AI spending arriving; "
                 "a sequential drop means buyers are slowing down.",
                 change < 0, f"Latest quarter vs previous: {pct(change, True)}.")
@@ -298,17 +463,22 @@ def block_nvidia():
 
 
 def block_backlog():
-    rows, dropped = [], []
+    rows, dropped, panels = [], [], []
     for ticker, cik in BACKLOG:
         rpo = point_in_time(sec_concept(cik, "RevenueRemainingPerformanceObligation"))
         ends = list(rpo)[-6:]
         change = (rpo[ends[-1]] / rpo[ends[-2]] - 1) * 100
         if change <= -BACKLOG_DROP_PCT:
             dropped.append(ticker)
-        rows.append([ticker, esc(ends[-1])," · ".join(billions(rpo[e]) for e in ends),
-                     pct(change, True)])
-    out = table(["Company", "Latest quarter end", "Contract backlog, last 6 quarters ($B)",
-                 "Latest vs previous quarter"], rows)
+        panels.append((ticker, ends, [rpo[e] / 1e9 for e in ends]))
+        rows.append([ticker, esc(ends[-1]), pct(change, True)])
+    domain = (0, max(max(v) for *_, v in panels))
+    out = ('<p class="muted">Contract backlog, last 6 quarters by quarter-end month, $B, same scale '
+           'for every company. Hover a bar for its exact value.</p><div class="multiples">')
+    out += "".join(f"<div><h5>{t}</h5>" + column_chart(ends, [("Backlog", SERIES[0], v)], money_b, domain,
+                                                      aria=f"{t} contract backlog, last 6 quarters")
+                   + "</div>" for t, ends, v in panels) + "</div>"
+    out += table(["Company", "Latest quarter end", "Latest vs previous quarter"], rows)
     out += line(
         f"backlog falls more than {BACKLOG_DROP_PCT}% in a quarter at any of the three. "
         "Much of this backlog is OpenAI and Anthropic compute commitments (e.g. OpenAI's $300B "
@@ -320,9 +490,10 @@ def block_backlog():
 
 
 def block_gpu_prices():
-    rows, crossed = [], []
-    for slug, name in GPU_MODELS:
+    rows, crossed, lines = [], [], []
+    for i, (slug, name) in enumerate(GPU_MODELS):
         weeks = gpu_weekly(slug)
+        lines.append((name, SERIES[i], [(w, p) for w, p, _ in weeks]))
         week, price, providers = weeks[-1]
 
         def change(n, i=len(weeks) - 1):
@@ -333,15 +504,19 @@ def block_gpu_prices():
             crossed.append(name)
         worst = min((change(13, i) for i in range(13, len(weeks))), default=None)
         rows.append([
-            name, f"${price:.2f} (week of {esc(week)}, {providers} providers)",
+            name, f"${price:.2f}", f"{esc(week)} ({providers} providers)",
             pct(change(4)),
             f'<span class="bad">{pct(c13)}</span>' if name in crossed else pct(c13),
             pct(worst), pct(change(len(weeks) - 1)) + f" (since {esc(weeks[0][0])})",
-            " · ".join(f"{p:.2f}" for _, p, _ in weeks[-14:]),
         ])
-    out = table(["GPU", "Latest weekly median, $/GPU-hour", "4 weeks", "13 weeks",
-                 "Worst 13-week change in the data", "Whole series",
-                 "Weekly medians, last 14 weeks ($, oldest → newest)"], rows)
+    out = legend([(n, c) for n, c, _ in lines])
+    out += ('<p class="muted">Weekly median on-demand price, $/GPU-hour; vertical lines mark the '
+            'start of each month. Hover a line for the week and price.</p>')
+    fmt = lambda v, tick=False: f"${v:.0f}" if tick else f"${v:.2f}"
+    out += (f'<div class="wide">{line_chart(lines, fmt, aria="Weekly median GPU rental prices")}</div>'
+            f'<div class="narrow">{line_chart(lines, fmt, w=380, h=260, label_every=3, aria="Weekly median GPU rental prices")}</div>')
+    out += table(["GPU", "Latest weekly median, $/GPU-hour", "Latest week", "4 weeks", "13 weeks",
+                 "Worst 13-week change in the data", "Whole series"], rows)
     out += line(
         f"the on-demand median falls {GPU_DROP_13W_PCT}% or more over 13 weeks (about 90 days). "
         "Over the past year these prices rose and their worst 13-week dips were small (see the "
@@ -421,8 +596,9 @@ def block_spreads():
 def block_cds():
     today = date.today()
     start = today - timedelta(days=cds_signal.WINDOW_DAYS)
-    data = cds_signal.series(today)
-    out = ('<p class="legend"><span class="key" style="background:#2a78d6"></span>5-year default '
+    data = cds_signal.series(today, download=not CACHED)
+    out = ('<p class="legend"><span class="key" style="background:#2a78d6;border:2px solid #2a78d6;'
+           'width:6px;height:6px;border-radius:50%"></span>5-year default '
            'probability, monthly median (left axis, from 0%); bar = 90% interval '
            '<span class="key" style="background:#fff;border:2px solid #2a78d6;width:6px;height:6px;'
            'border-radius:50%"></span>hollow = payment direction assumed (see note below) '
@@ -439,22 +615,18 @@ def block_cds():
         out += f"<h4>{esc(name)} ({ticker})</h4>" + cds_signal.svg_chart(ticker, series, closes, start, today) + note
         idx = [i for i, s in enumerate(series) if s[1] is not None]
         if not idx:
-            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "n/a", "n/a", "0"])
+            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "0"])
             continue
-        i = idx[-1]
-        ago = lambda k: (f"{series[i - k][1] * 100:.1f}%" if i >= k and series[i - k][1] is not None
-                         else "n/a")
-        m, med, lo, hi, n, assumed = series[i]
+        m, med, lo, hi, n, assumed = series[idx[-1]]
         rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
         rec = (f"{rec_lo * 100:.1f}–{rec_hi * 100:.1f}%" if rec_lo is not None and rec_hi is not None
                else "n/a")
         rows.append([f"{esc(name)} ({ticker})",
                      f"{med * 100:.1f}% ({lo * 100:.1f}–{hi * 100:.1f}%), {m:%b %Y}" + " *" * assumed,
-                     rec, ago(3), ago(12), str(n)])
+                     rec, str(n)])
     rec_lo, rec_hi = (f"{r:.0%}" for r in cds_signal.RECOVERY_RANGE)
     out += table(["Company", "5-year default probability, latest month (90% interval)",
-                  f"Same month at {rec_lo}–{rec_hi} recovery", "3 months earlier",
-                  "12 months earlier", "Trades in latest month"], rows)
+                  f"Same month at {rec_lo}–{rec_hi} recovery", "Trades in latest month"], rows)
     out += no_line(
         "This is what credit default swap buyers pay for protection against each company's "
         "bankruptcy or failure to pay on its own debt within 5 years (a restructuring doesn't "
@@ -1070,18 +1242,18 @@ def block_news():
 
 
 SECTIONS = [
-    ("1. The trigger: is AI spending still being paid for?", [
+    ("1. Capex and income", [
         ("Hyperscaler capex and free cash flow", block_hyperscalers),
         ("Nvidia revenue", block_nvidia),
         ("Contract backlog at Oracle, Microsoft and Alphabet", block_backlog),
         ("GPU rental prices", block_gpu_prices),
     ]),
-    ("2. Credit markets: are lenders getting nervous?", [
+    ("2. Credit", [
         ("Corporate bond spreads", block_spreads),
         ("Credit default swaps: market-implied default probability", block_cds),
         ("Weakest AI borrowers (stock prices)", block_weak_borrowers),
     ]),
-    ("3. Insurance money: is the funding still coming in?", [
+    ("3. Insurance", [
         ("Annuity sales", block_annuities),
     ]),
     ("4. Headlines", [
@@ -1115,6 +1287,11 @@ summary{cursor:pointer;color:#333}
 .muted{color:#666;font-size:12px;margin:4px 0}
 h4{font-size:13px;margin:16px 0 2px}
 .legend{font-size:12px;color:#52514e;margin:6px 0}
+.multiples{display:flex;flex-wrap:wrap;gap:4px 12px}
+.multiples>div{flex:0 1 300px;min-width:260px}
+.narrow{display:none}
+@media (max-width:600px){.wide{display:none}.narrow{display:block}}
+.multiples h5{margin:8px 0 0;font-size:12px}
 .key{display:inline-block;width:14px;height:8px;vertical-align:middle;margin:0 5px 0 12px;border-radius:2px}
 .legend .key:first-child{margin-left:0}
 .error{color:#b00020}
@@ -1123,6 +1300,17 @@ h4{font-size:13px;margin:16px 0 2px}
 
 def main():
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if CACHED:
+        try:
+            with open(FETCHED_AT) as f:
+                fetched = f.read().strip()
+        except OSError:
+            sys.exit("No saved responses yet: run once without --cached first.")
+        generated = f"{generated} from data fetched {fetched}"
+    else:
+        os.makedirs(HTTP_CACHE, exist_ok=True)
+        with open(FETCHED_AT, "w") as f:
+            f.write(generated)
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",

@@ -107,12 +107,16 @@ def scan(today):
             for member in z.namelist():
                 if not member.lower().endswith(".csv"):
                     continue
-                reader = csv.reader(io.StringIO(z.read(member).decode("utf-8", "replace")))
-                header = next(reader)
+                lines = z.read(member).decode("utf-8", "replace").splitlines()
+                header = next(csv.reader(lines[:1]))
                 # The entity is named in one of these columns (often only the UPI one). If a future
                 # schema drops both, fall back to searching the whole row rather than finding nothing.
                 cols = [header.index(c) for c in NAME_COLUMNS if c in header]
-                for row in reader:
+                if any(line.count('"') % 2 for line in lines):  # a quoted field spans lines
+                    candidates = csv.reader(lines[1:])
+                else:  # parse only the lines that mention a name (about 1 in 100), much faster
+                    candidates = csv.reader(l for l in lines[1:] if any(n in l.upper() for n in NAMES.values()))
+                for row in candidates:
                     text = (" | ".join(row[i] for i in cols if i < len(row)) if cols else ",".join(row)).upper()
                     for ticker, needle in NAMES.items():
                         if needle in text:
@@ -157,11 +161,12 @@ def _rescaled_spread(s, day, valid):
     return None
 
 
-def resolve(rows, start, lo=4, hi=6, rec=R):
+def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
     """One ticker's raw rows -> priced trades with lo <= years left <= hi, as dicts: trade and
     file_date (dates), maturity, T (years left), coupon, upfront (signed clean up-front, fraction
     of notional), hazard (flat default rate pricing the trade), anchored (direction from a quote).
-    rec is the assumed recovery rate."""
+    rec is the assumed recovery rate. since (a date) limits the output, and the pricing work, to
+    trades on or after it; direction anchors still come from the whole window."""
     errored = {r.get("Original Dissemination Identifier") for r in rows if r.get("Action type") == "EROR"}
     latest = {}
     for r in sorted(rows, key=lambda r: r["file_date"]):
@@ -202,14 +207,14 @@ def resolve(rows, start, lo=4, hi=6, rec=R):
             return math.nan
 
     valid = [(base["trade"], spread(r)) for r, _, base in trades if 0.001 <= spread(r) <= 0.5]
-    quotes = []  # (base, spread, hazard)
+    quotes = []  # (base, spread)
     upfronts = []  # (base, |reported up-front|, accrued), as fractions of notional
     for r, eff, base in trades:
         s = spread(r)
         if not 0.001 <= s <= 0.5:  # a few prints carry values in other units
             s = _rescaled_spread(s, base["trade"], valid) or math.nan
         if 0.001 <= s <= 0.5:
-            quotes.append((base, s, _implied_hazard(0, base["T"], s, rec)))
+            quotes.append((base, s))
             continue
         notional, upfront = r.get("Notional amount-Leg 1", ""), r.get("Other payment amount", "")
         if not notional or "+" in notional or not upfront:  # "5,000,000+" hides the real size
@@ -241,9 +246,15 @@ def resolve(rows, start, lo=4, hi=6, rec=R):
         q = min(usable, key=lambda q: abs((q[0]["trade"] - day).days))
         return 1 if q[1] > coupon else -1
 
-    out = [dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"], rec), hazard=h, anchored=True)
-           for base, _, h in quotes]
+    wanted = lambda base: since is None or base["trade"] >= since
+    out = []
+    for base, s in quotes:
+        if wanted(base):
+            h = _implied_hazard(0, base["T"], s, rec)
+            out.append(dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"], rec), hazard=h, anchored=True))
     for base, paid, accrued in upfronts:
+        if not wanted(base):
+            continue
         side = quote_side(base["trade"], base["coupon"])
         u = (side or 1) * paid - accrued
         out.append(dict(base, upfront=u, hazard=_implied_hazard(u, base["T"], base["coupon"], rec),
@@ -251,11 +262,11 @@ def resolve(rows, start, lo=4, hi=6, rec=R):
     return out
 
 
-def trade_pds(rows, start, rec=R):
+def trade_pds(rows, start, rec=R, since=None):
     """[(trade date, 5y default probability, direction anchored by a quote)] from near-5y contracts
     only (4-6 years left), so the curve's slope doesn't bias the estimate."""
     return sorted((t["trade"], 1 - math.exp(-HORIZON * t["hazard"]), t["anchored"])
-                  for t in resolve(rows, start, 4, 6, rec))
+                  for t in resolve(rows, start, 4, 6, rec, since))
 
 
 def months(start, end):
@@ -289,16 +300,17 @@ def recovery_range(rows, start, month):
     """{recovery rate: median 5y default probability in month} for R and each RECOVERY_RANGE rate."""
     out = {}
     for rec in sorted({R, *RECOVERY_RANGE}):
-        v = [p for d, p, _ in trade_pds(rows, start, rec) if d.replace(day=1) == month]
+        v = [p for d, p, _ in trade_pds(rows, start, rec, since=month) if d.replace(day=1) == month]
         out[rec] = st.median(v) if v else None
     return out
 
 
-def series(today):
+def series(today, download=True):
     """{ticker: (monthly series, recovery_range for its latest month with trades, or {})} after
-    syncing the cache."""
+    syncing the cache (download=False uses only the files already cached)."""
     start = today - timedelta(days=WINDOW_DAYS)
-    sync(today)
+    if download:
+        sync(today)
     out = {}
     for t, rows in scan(today).items():
         data = monthly(trade_pds(rows, start), start, today)
@@ -317,7 +329,7 @@ PD_COLOR, PRICE_COLOR = "#2a78d6", "#8f8d87"
 def _nice_pd_max(v):
     for step in (0.01, 0.02, 0.05, 0.1, 0.2):
         top = math.ceil(v / step) * step
-        if top / step <= 6:
+        if top / step <= 10:
             return top, step
     return 1.0, 0.2
 
@@ -357,11 +369,14 @@ def svg_chart(ticker, data, closes, start, end):
         p = i * step; yy = y(p)
         out.append(f'<line x1="{ML}" x2="{W - MR}" y1="{yy:.1f}" y2="{yy:.1f}" stroke="#e6e5e1"/>')
         out.append(f'<text x="{ML - 6}" y="{yy + 4:.1f}" text-anchor="end" fill="#52514e">{p * 100:.0f}%</text>')
-    # month labels, every third month
+    # a vertical line at each month start; labels (month and year) every second month, centred on
+    # the month like its dot
     for i, (m, *_rest) in enumerate(data):
-        if i % 3 == 0:
+        if m > start:
+            out.append(f'<line x1="{x(m):.1f}" x2="{x(m):.1f}" y1="{MT}" y2="{MT + ph}" stroke="#e6e5e1"/>')
+        if i % 2 == 0:
             xx = x(m + timedelta(days=15))
-            out.append(f'<text x="{xx:.1f}" y="{H - 8}" text-anchor="middle" fill="#52514e">{m:%b %y}</text>')
+            out.append(f'<text x="{xx:.1f}" y="{H - 8}" text-anchor="middle" fill="#52514e">{m:%b} ’{m:%y}</text>')
 
     # stock price, log scale, right axis
     closes = [(d, c) for d, c in closes if start <= d <= end and c > 0]

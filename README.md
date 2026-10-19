@@ -14,5 +14,5 @@ In addition, the dashboard estimates default probabilities for CoreWeave, Oracle
 
 To create the dashboard:
 1. Put your DeepSeek API key in `.deepseek_api_key` or the `DEEPSEEK_API_KEY` environment variable.
-2. Run `python3 bubble_watch.py` to build `dashboard.html`.
+2. Run `python3 bubble_watch.py` to build `dashboard.html`. Pass `--cached` to use stale data in development.
 3. Optionally, run `python3 serve_dashboard.py` to serve the html on port 8080.
