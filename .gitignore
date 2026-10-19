@@ -11,3 +11,7 @@ data/
 # DTCC downloads, refetched on demand by cds_signal.py / cds.py
 cds/dtcc_cache/
 cds/dtcc_missing.json
+
+# Editor swap files
+*.swp
+*.swo

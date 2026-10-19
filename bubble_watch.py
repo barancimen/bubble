@@ -357,12 +357,43 @@ def block_gpu_prices():
         "is left out until it is complete.</p>")
 
 
+def spread_episodes(rows, limit):
+    """(first date scanned, [(start, end, peak excess)]) for runs of consecutive observations at
+    least limit bp above the trailing 1-year low. Only dates with a full year of history before
+    them are scanned, since FRED serves just the last three years of these series."""
+    pts = [(date.fromisoformat(d), v) for d, v in rows]
+    first = pts[0][0] + timedelta(days=365)
+    episodes, run = [], None
+    for d, v in pts:
+        if d < first:
+            continue
+        excess = v - min(x for e, x in pts if d - timedelta(days=365) <= e <= d)
+        if excess >= limit:
+            run = [d, d, excess] if run is None else [run[0], d, max(run[2], excess)]
+        elif run:
+            episodes.append(tuple(run))
+            run = None
+    if run:
+        episodes.append(tuple(run))
+    return first, episodes
+
+
+def describe_episodes(name, limit, first, episodes):
+    if not episodes:
+        return f"Since {first:%b %Y}, {name} have not been {limit}bp above their 1-year low."
+    spans = "; ".join(f"{a:%b %-d, %Y}" + ("" if a == b else f" – {b:%b %-d, %Y}") + f" (peak +{p:.0f}bp)"
+                      for a, b, p in episodes)
+    times = "once" if len(episodes) == 1 else f"{len(episodes)} times"
+    return f"Since {first:%b %Y}, {name} crossed their line {times}: {spans}."
+
+
 def block_spreads():
-    out_rows, crossed = [], []
-    for series_id, name, limit in [("BAMLC0A4CBBB", "BBB corporate (lowest investment grade)",
-                                    BBB_WIDENING_BP),
-                                   ("BAMLH0A0HYM2", "High yield", HY_WIDENING_BP)]:
+    out_rows, crossed, history = [], [], []
+    for series_id, name, short, limit in [("BAMLC0A4CBBB", "BBB corporate (lowest investment grade)",
+                                           "BBB spreads", BBB_WIDENING_BP),
+                                          ("BAMLH0A0HYM2", "High yield", "high-yield spreads", HY_WIDENING_BP)]:
         rows = fred_series(series_id)
+        history.append(describe_episodes(short, limit, *spread_episodes(rows, limit)))
         d, latest = rows[-1]
         year_ago = (date.fromisoformat(d) - timedelta(days=365)).isoformat()
         low_d, low = min(((x, v) for x, v in rows if x >= year_ago), key=lambda p: p[1])
@@ -380,8 +411,7 @@ def block_spreads():
                  "Above 1-year low", "Worry line"], out_rows)
     out += line(
         f"BBB spreads are {BBB_WIDENING_BP}bp or more above their 1-year low, or high-yield "
-        f"spreads {HY_WIDENING_BP}bp or more. In the last three years these lines were crossed "
-        "only once, in the April–May 2025 tariff shock (peaks of +52bp and +202bp). "
+        f"spreads {HY_WIDENING_BP}bp or more. {' '.join(history)} "
         "These cover the whole market, not just AI debt, so they confirm stress more than predict it.",
         bool(crossed), f"Crossed: {', '.join(crossed)}." if crossed else "")
     return out + source("ICE BofA option-adjusted spreads via FRED",
@@ -405,35 +435,44 @@ def block_cds():
             note = ""
         except Exception as e:
             closes, note = [], f'<p class="error">Stock price unavailable today: {esc(e)}</p>'
-        out += f"<h4>{esc(name)} ({ticker})</h4>" + cds_signal.svg_chart(ticker, data[ticker], closes, start, today) + note
-        series = data[ticker]
+        series, by_rec = data[ticker]
+        out += f"<h4>{esc(name)} ({ticker})</h4>" + cds_signal.svg_chart(ticker, series, closes, start, today) + note
         idx = [i for i, s in enumerate(series) if s[1] is not None]
         if not idx:
-            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "n/a", "0"])
+            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "n/a", "n/a", "0"])
             continue
         i = idx[-1]
         ago = lambda k: (f"{series[i - k][1] * 100:.1f}%" if i >= k and series[i - k][1] is not None
                          else "n/a")
         m, med, lo, hi, n, assumed = series[i]
+        rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
+        rec = (f"{rec_lo * 100:.1f}–{rec_hi * 100:.1f}%" if rec_lo is not None and rec_hi is not None
+               else "n/a")
         rows.append([f"{esc(name)} ({ticker})",
                      f"{med * 100:.1f}% ({lo * 100:.1f}–{hi * 100:.1f}%), {m:%b %Y}" + " *" * assumed,
-                     ago(3), ago(12), str(n)])
+                     rec, ago(3), ago(12), str(n)])
+    rec_lo, rec_hi = (f"{r:.0%}" for r in cds_signal.RECOVERY_RANGE)
     out += table(["Company", "5-year default probability, latest month (90% interval)",
-                  "3 months earlier", "12 months earlier", "Trades in latest month"], rows)
+                  f"Same month at {rec_lo}–{rec_hi} recovery", "3 months earlier",
+                  "12 months earlier", "Trades in latest month"], rows)
     out += no_line(
         "This is what credit default swap buyers pay for protection against each company's "
         "bankruptcy or failure to pay on its own debt within 5 years (a restructuring doesn't "
         "count, nor does a default by a separate financing subsidiary). It is a market price, "
         "not a forecast: it includes a premium for bearing the risk, so true odds are lower, and "
-        "it assumes lenders recover 40% in a default. Worry when it climbs for several months "
+        f"it assumes lenders recover {cds_signal.R:.0%} in a default. That assumption matters: "
+        f"the recovery column shows the same month priced at {rec_lo} and {rec_hi} recovery "
+        "(lower recovery means a lower implied default probability for the same price). Worry when it climbs for several months "
         "in a row, and most when CoreWeave and Oracle climb together while Nvidia stays flat, "
         "which points to the AI financing chain rather than chip demand.")
     return out + (
         '<p class="muted">Source: <a href="https://pddata.dtcc.com/ppd/secdashboard">DTCC public '
         "security-based swap data</a> (SEC Regulation SBSR) and Yahoo Finance daily closes. Uses "
-        "standard-coupon trades with 4–6 years left, priced from their quoted spread or, failing "
-        'that, their up-front payment and exact size (trades reported only as "$5,000,000+" '
-        "without a spread are left out). DTCC reports an up-front's size but not who paid it: "
+        "US-dollar standard-coupon trades with 4–6 years left, priced from their quoted spread or, "
+        'failing that, their up-front payment and exact size (trades reported only as "$5,000,000+" '
+        "without a spread are left out). Some spreads are reported 100 times too small; these are "
+        "scaled up only when the result matches properly reported quotes within "
+        f"{cds_signal.RESCALE_DAYS} days, and otherwise left out. DTCC reports an up-front's size but not who paid it: "
         "the buyer pays when the spread is above the contract's fixed coupon, the seller when "
         "it is below. A nearby quoted spread settles the direction; where none exists since the "
         "spread last came near the coupon, the buyer is assumed to pay (hollow dots, * in the "
@@ -805,9 +844,12 @@ def block_annuities():
     out, _, detail = feed_block("F")
     out += line(
         "LIMRA's quarterly total annuity sales come in below the same quarter a year earlier, "
-        "two quarters in a row. Record annuity sales are the insurer money that buys the "
-        "investment-grade AI debt (Ares's first flow). Headlines reporting a decline are "
-        "flagged ALERT; check whether two quarters in a row are down.",
+        "two quarters in a row. Annuity sales bring in much of the insurer money that Ares says "
+        "buys the investment-grade AI debt (its first flow). This dashboard does not have LIMRA's "
+        "figures, so this test is manual: compare the last two quarterly totals in LIMRA's releases "
+        "with a year earlier. The stories above are news only; a flagged one means a headline "
+        "reported some decline, which may be a single quarter or one product line, not that the "
+        "test is met.",
         None, detail)
     return out + source("LIMRA annuity research", "https://www.limra.com/en/research/annuities/")
 
@@ -839,7 +881,7 @@ SECTIONS = [
         ("Weakest AI borrowers (stock prices)", block_weak_borrowers),
     ]),
     ("3. Insurance money: is the funding still coming in?", [
-        ("Annuity sales", block_annuities),
+        ("Annuity sales news (manual check)", block_annuities),
     ]),
     ("4. Headlines", [
         ("", block_news),
@@ -848,8 +890,10 @@ SECTIONS = [
 
 NOT_HERE = (
     "No free source exists for: prices of the private placements and securitizations, the contract exit clauses inside individual deals, "
-    "insurers' return on equity, and the off-balance-sheet lease commitments Ares cites "
-    "(they aren't in standardized filing data). The capex and backlog figures lag by one to "
+    "insurers' return on equity, and the off-balance-sheet commitments Ares cites: data-center "
+    "leases signed but not yet started, and take-or-pay contracts for power and capacity. Those "
+    "appear only in the text of filing footnotes, not in the tagged figures this dashboard reads "
+    "(leases already started are tagged, but they sit on the balance sheet). The capex and backlog figures lag by one to "
     "three months. Ares's own advice is to cut risk before signals cross, not after: "
     "\"cycles are easy, but timing is hard.\""
 )

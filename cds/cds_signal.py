@@ -9,7 +9,8 @@ Method: for each fresh standard-coupon trade with 4-6 years left, solve for the
 constant default rate (hazard) that prices its up-front payment, assuming 40%
 recovery and a flat 3.75% risk-free rate; 5-year default probability is then
 1 - exp(-5 * hazard). Trades are pooled by month: median, with a 90% bootstrap
-interval. Used by the AI bubble dashboard (../bubble_watch.py).
+interval. The latest month is also priced at 30% and 50% recovery, since the result
+is sensitive to that assumption. Used by the AI bubble dashboard (../bubble_watch.py).
 """
 import csv
 import io
@@ -18,6 +19,7 @@ import math
 import os
 import random
 import statistics as st
+import urllib.error
 import urllib.request
 import zipfile
 from datetime import date, timedelta
@@ -32,12 +34,31 @@ NAMES = {"CRWV": "COREWEAVE", "ORCL": "ORACLE", "NVDA": "NVIDIA"}  # ticker -> r
 WINDOW_DAYS = 730          # charts span the last 24 months
 R, RATE = 0.4, 0.0375      # assumed recovery rate, flat risk-free rate
 HORIZON = 5                # years
+RECOVERY_RANGE = (0.3, 0.5)  # shown alongside R so the recovery assumption is visible
+NAME_COLUMNS = ("Underlying Asset Name", "UPI Underlier Name")
+CURRENCY_COLUMN = "Notional currency-Leg 1"
+RESCALE_DAYS, RESCALE_SLACK = 10, 1.25  # see _rescaled_spread
 
 
 # ---------- data ----------
 
 def _path(day):
     return os.path.join(CACHE, f"SEC_CUMULATIVE_CREDITS_{day:%Y_%m_%d}.zip")
+
+
+def _save(day, blob):
+    """Writes a downloaded day to the cache only if it is a readable zip, via a temp file so a
+    crash can't leave a truncated file behind. Bad downloads are dropped and retried next run."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            if z.testzip() is not None:
+                return
+    except zipfile.BadZipFile:
+        return
+    tmp = _path(day) + ".part"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, _path(day))
 
 
 def sync(today):
@@ -57,13 +78,15 @@ def sync(today):
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
                     blob = r.read()
+            except urllib.error.HTTPError as e:
+                # Only a 404 means "no file for this day"; recent days may just not be out yet.
+                if e.code == 404 and day < today - timedelta(days=7):
+                    missing.add(day.isoformat())
+                blob = None  # anything else (5xx, throttling) is retried on the next run
             except OSError:
-                blob = b""
-            if blob.startswith(b"PK"):
-                with open(_path(day), "wb") as f:
-                    f.write(blob)
-            elif day < today - timedelta(days=7):  # recent days may just not be published yet
-                missing.add(day.isoformat())
+                blob = None  # timeouts and network errors: retry on the next run
+            if blob is not None:
+                _save(day, blob)
         day += timedelta(days=1)
     with open(MISSING, "w") as f:
         json.dump(sorted(d for d in missing if d >= start.isoformat()), f)
@@ -86,9 +109,11 @@ def scan(today):
                     continue
                 reader = csv.reader(io.StringIO(z.read(member).decode("utf-8", "replace")))
                 header = next(reader)
+                # The entity is named in one of these columns (often only the UPI one). If a future
+                # schema drops both, fall back to searching the whole row rather than finding nothing.
+                cols = [header.index(c) for c in NAME_COLUMNS if c in header]
                 for row in reader:
-                    # Name columns have shifted across DTCC schema versions, so search the whole row.
-                    text = ",".join(row).upper()
+                    text = (" | ".join(row[i] for i in cols if i < len(row)) if cols else ",".join(row)).upper()
                     for ticker, needle in NAMES.items():
                         if needle in text:
                             hits[ticker].append(dict(zip(header, row), file_date=day.isoformat()))
@@ -102,32 +127,49 @@ def _last_coupon_date(d):
                 return date(y, m, 20)
 
 
-def _flat_upfront(h, T, coupon):
+def _flat_upfront(h, T, coupon, rec=R):
     """Protection leg minus running-coupon premium leg at constant hazard h, monthly grid."""
     n = max(1, int(T * 12)); dt = T / n; prot = prem = 0
     for i in range(1, n + 1):
         t = i * dt; df = math.exp(-RATE * t)
         s0, s1 = math.exp(-h * (t - dt)), math.exp(-h * t)
-        prot += (1 - R) * df * (s0 - s1); prem += coupon * dt * df * (s0 + s1) / 2
+        prot += (1 - rec) * df * (s0 - s1); prem += coupon * dt * df * (s0 + s1) / 2
     return prot - prem
 
 
-def _implied_hazard(u, T, coupon):
+def _implied_hazard(u, T, coupon, rec=R):
     lo, hi = 0.0, 2.0
     for _ in range(50):
         mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if _flat_upfront(mid, T, coupon) < u else (lo, mid)
+        lo, hi = (mid, hi) if _flat_upfront(mid, T, coupon, rec) < u else (lo, mid)
     return mid
 
 
-def resolve(rows, start, lo=4, hi=6):
+def _rescaled_spread(s, day, valid):
+    """Some prints carry the spread 100x too small (0.00045 for 450bp). Returns s * 100 when that
+    lands inside the band of properly reported quotes within RESCALE_DAYS of the trade (widened
+    by RESCALE_SLACK), else None: with no nearby quote to confirm it, the print is not used."""
+    if not 0 < s < 0.001:
+        return None
+    near = [q for d, q in valid if abs((d - day).days) <= RESCALE_DAYS]
+    if near and min(near) / RESCALE_SLACK <= s * 100 <= max(near) * RESCALE_SLACK:
+        return s * 100
+    return None
+
+
+def resolve(rows, start, lo=4, hi=6, rec=R):
     """One ticker's raw rows -> priced trades with lo <= years left <= hi, as dicts: trade and
     file_date (dates), maturity, T (years left), coupon, upfront (signed clean up-front, fraction
-    of notional), hazard (flat default rate pricing the trade), anchored (direction from a quote)."""
+    of notional), hazard (flat default rate pricing the trade), anchored (direction from a quote).
+    rec is the assumed recovery rate."""
     errored = {r.get("Original Dissemination Identifier") for r in rows if r.get("Action type") == "EROR"}
     latest = {}
     for r in sorted(rows, key=lambda r: r["file_date"]):
         if r.get("Action type") not in ("NEWT", "CORR", "MODI") or r.get("Fixed rate-Leg 1") not in ("0.01", "0.05"):
+            continue
+        # EUR and blank-currency prints aren't comparable. Checked here rather than in scan, because
+        # error cancellations (EROR) often have a blank currency and must still knock trades out.
+        if r.get(CURRENCY_COLUMN, "USD") != "USD":
             continue
         key = r.get("Original Dissemination Identifier") or r.get("Dissemination Identifier")
         if key in errored or r.get("Dissemination Identifier") in errored:
@@ -153,15 +195,21 @@ def resolve(rows, start, lo=4, hi=6):
 
     # Some trades report a quoted spread instead of an up-front payment. They price directly
     # (up-front of zero at a coupon equal to the spread), whatever the trade size.
+    def spread(r):
+        try:
+            return float(r.get("Spread-Leg 1") or "nan")
+        except ValueError:
+            return math.nan
+
+    valid = [(base["trade"], spread(r)) for r, _, base in trades if 0.001 <= spread(r) <= 0.5]
     quotes = []  # (base, spread, hazard)
     upfronts = []  # (base, |reported up-front|, accrued), as fractions of notional
     for r, eff, base in trades:
-        try:
-            s = float(r.get("Spread-Leg 1") or "nan")
-        except ValueError:
-            s = math.nan
-        if 0.001 <= s <= 0.5:  # a few prints carry values in other units; skip those
-            quotes.append((base, s, _implied_hazard(0, base["T"], s)))
+        s = spread(r)
+        if not 0.001 <= s <= 0.5:  # a few prints carry values in other units
+            s = _rescaled_spread(s, base["trade"], valid) or math.nan
+        if 0.001 <= s <= 0.5:
+            quotes.append((base, s, _implied_hazard(0, base["T"], s, rec)))
             continue
         notional, upfront = r.get("Notional amount-Leg 1", ""), r.get("Other payment amount", "")
         if not notional or "+" in notional or not upfront:  # "5,000,000+" hides the real size
@@ -193,21 +241,21 @@ def resolve(rows, start, lo=4, hi=6):
         q = min(usable, key=lambda q: abs((q[0]["trade"] - day).days))
         return 1 if q[1] > coupon else -1
 
-    out = [dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"]), hazard=h, anchored=True)
+    out = [dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"], rec), hazard=h, anchored=True)
            for base, _, h in quotes]
     for base, paid, accrued in upfronts:
         side = quote_side(base["trade"], base["coupon"])
         u = (side or 1) * paid - accrued
-        out.append(dict(base, upfront=u, hazard=_implied_hazard(u, base["T"], base["coupon"]),
+        out.append(dict(base, upfront=u, hazard=_implied_hazard(u, base["T"], base["coupon"], rec),
                         anchored=side is not None))
     return out
 
 
-def trade_pds(rows, start):
+def trade_pds(rows, start, rec=R):
     """[(trade date, 5y default probability, direction anchored by a quote)] from near-5y contracts
     only (4-6 years left), so the curve's slope doesn't bias the estimate."""
     return sorted((t["trade"], 1 - math.exp(-HORIZON * t["hazard"]), t["anchored"])
-                  for t in resolve(rows, start, 4, 6))
+                  for t in resolve(rows, start, 4, 6, rec))
 
 
 def months(start, end):
@@ -237,11 +285,26 @@ def monthly(pts, start, end):
     return out
 
 
+def recovery_range(rows, start, month):
+    """{recovery rate: median 5y default probability in month} for R and each RECOVERY_RANGE rate."""
+    out = {}
+    for rec in sorted({R, *RECOVERY_RANGE}):
+        v = [p for d, p, _ in trade_pds(rows, start, rec) if d.replace(day=1) == month]
+        out[rec] = st.median(v) if v else None
+    return out
+
+
 def series(today):
-    """{ticker: monthly series} after syncing the cache."""
+    """{ticker: (monthly series, recovery_range for its latest month with trades, or {})} after
+    syncing the cache."""
     start = today - timedelta(days=WINDOW_DAYS)
     sync(today)
-    return {t: monthly(trade_pds(rows, start), start, today) for t, rows in scan(today).items()}
+    out = {}
+    for t, rows in scan(today).items():
+        data = monthly(trade_pds(rows, start), start, today)
+        have = [m for m, med, *_ in data if med is not None]
+        out[t] = (data, recovery_range(rows, start, have[-1]) if have else {})
+    return out
 
 
 # ---------- chart ----------

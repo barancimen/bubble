@@ -125,11 +125,21 @@ of a peak (distortion 3), and expect vendors to differ by 5–10% on the same da
 
 ## Known issues / to-do
 
-- **Spreads in odd units are discarded.** Some trades report spreads such as `0.000042` (NVDA, Mar
-  2026), `0.00045` (CRWV, Oct 2025) and `0.000223` (ORCL, Oct 2026). They look like the right
-  spreads written 100× too small (42bp, 450bp, 223bp), matching neighboring quotes. Scaling values
-  below 0.001 by 100 would add NVDA history from Nov 2025 and more direction anchors for
-  CoreWeave. Not done yet.
+- **Spreads in odd units (guarded rescale, done 2026-10-19).** Some trades report spreads 100×
+  too small, e.g. `0.000223` (ORCL, Oct 2026). `cds_signal._rescaled_spread` multiplies values
+  below 0.001 by 100 only when the result falls within the range of properly reported quotes
+  within 10 days (±25%); otherwise the print is dropped. This adds ~17 ORCL, 3 CRWV and 2 NVDA
+  trades. Of the three documented examples, only ORCL's is confirmed: `0.000042` (NVDA, Mar 2026)
+  has no proper quote within 96 days, and `0.00045` (CRWV, 2025-10-24) none within 22 days, so
+  both stay out. Oracle also has recurring `0.000048`/`0.00005`/`0.000056` prints that the guard
+  rejects whenever Oracle trades far from 50bp, which suggests some of these are not simple unit
+  errors. Tests: `python3 -m unittest test_cds_signal` from `cds/`.
+- **Recovery sensitivity.** The dashboard now shows the latest month at 30% and 50% recovery next
+  to the 40% estimate (e.g. CRWV Oct 2026: 48.8% / 55.1% / 63.1%).
+- **Trade filter.** Rows are matched on `Underlying Asset Name` or `UPI Underlier Name` (many
+  Oracle and Nvidia trades name the entity only in the latter) instead of anywhere in the row, and
+  only USD trades are priced. The currency check sits in `resolve`, not `scan`, because some
+  error-cancellation (`EROR`) rows have a blank currency and must still cancel their trades.
 
 ## Results of the 2026-10-18 check
 
