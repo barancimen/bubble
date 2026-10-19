@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Serves dashboard.html, and nothing else, publicly on port 8080.
+
+The page is re-read on every request, so the daily cron run shows up
+without a restart. Runs as the bubble-dashboard systemd service.
+"""
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PAGE = os.path.join(HERE, "dashboard.html")
+PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+
+# The page has no scripts, images or forms, so the browser is told to refuse all of them.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; "
+                                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-cache",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "dashboard"  # don't advertise the Python version
+    sys_version = ""
+    timeout = 10  # drop connections that stall, so slow clients can't pile up
+
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/", "/dashboard.html"):
+            self.send_error(404)
+            return
+        try:
+            with open(PAGE, "rb") as f:
+                body = f.read()
+        except FileNotFoundError:
+            self.send_error(503, "Dashboard not generated yet")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # scanners hit public ports constantly; keep the journal quiet
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
