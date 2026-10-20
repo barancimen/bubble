@@ -337,7 +337,7 @@ def line(rule, crossed, detail=""):
     if crossed is None:
         status = "Check by hand"
     else:
-        status = '<span class="bad">CROSSED</span>' if crossed else "Not crossed"
+        status = '<span class="bad">WARNING</span>' if crossed else "No warning"
     detail = f" {detail}" if detail else ""
     return (f'<p class="line"><b>Start worrying when:</b> {rule}<br>'
             f"<b>Now:</b> {status}.{detail}</p>")
@@ -709,7 +709,7 @@ def block_backlog():
         "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
         "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
         True if crossed else (None if unknown else False),
-        (f"Crossed: {', '.join(crossed)}." if crossed else "")
+        (f"Lower than a year earlier or down two quarters in a row: {', '.join(crossed)}." if crossed else "")
         + (f" A quarter is missing from {', '.join(unknown)}'s latest filed figures, so check by hand." if unknown else "")
         + notes)
     return out + source("SEC EDGAR XBRL filings (remaining performance obligations)",
@@ -784,7 +784,7 @@ def block_gpu_prices():
         "Falling rental prices mean the chips backing GPU loans are losing value faster than lenders "
         "assumed. (Ares's chart covers 2023–25, when H100 rentals fell from about $8.50 to $3.00; Ares "
         "ties the risk to new chip generations, which Nvidia now ships roughly every year.)",
-        bool(crossed), f"Crossed: {', '.join(crossed)}." if crossed else "")
+        bool(crossed), f"Down {GPU_DROP_13W_PCT}% or more over 13 weeks: {', '.join(crossed)}." if crossed else "")
     return out + (
         '<p class="muted">Source: <a href="https://getdeploying.com/dataset/gpu-prices">'
         "GetDeploying, GPU rental price history</a>, "
@@ -852,7 +852,7 @@ def block_spreads():
         f"BBB spreads are {BBB_WIDENING_BP}bp or more above their 1-year low, or high-yield "
         f"spreads {HY_WIDENING_BP}bp or more. {' '.join(history)} "
         "These cover the whole market, not just AI debt, so they confirm stress more than predict it.",
-        bool(crossed), f"Crossed: {', '.join(crossed)}." if crossed else "")
+        bool(crossed), f"At or past the line: {', '.join(crossed)}." if crossed else "")
     return out + source("ICE BofA option-adjusted spreads via FRED",
                         "https://fred.stlouisfed.org/series/BAMLC0A4CBBB")
 
@@ -1484,6 +1484,9 @@ def feed_block(fid):
     feed = headlines()[0][fid]
     items = feed["stories"]
     flagged = [s for s in items if s["verdict"] == "alert"]
+    # Only stories shown on the page with a link count toward the verdict: `items` is what is
+    # shown, so a flagged story the cap left out today doesn't count.
+    linked = [s for s in flagged if any(h["link"] != "#" for h in s["headlines"])]
     rest = [s for s in items if s["verdict"] != "alert"]
     unjudged = [s for s in items if s["verdict"] is None]
     n_headlines = sum(len(s["headlines"]) for s in items)
@@ -1504,10 +1507,12 @@ def feed_block(fid):
                 f"({sum(s['new'] for s in more)} new today)</summary><ul>"
                 + "".join(map(story_item, more)) + "</ul></details>")
     detail = []
-    if flagged:
-        detail.append(f"{len(flagged)} flagged {'story' if len(flagged) == 1 else 'stories'} "
-                      f"({sum(s['new'] for s in flagged)} new today). The model can be wrong; "
+    if linked:
+        detail.append(f"{len(linked)} flagged {'story' if len(linked) == 1 else 'stories'} "
+                      f"({sum(s['new'] for s in linked)} new today). The model can be wrong; "
                       "read them.")
+    elif flagged:
+        detail.append("The flagged stories have no link to read, so check by hand.")
     elif items and not unjudged and feed["capped"]:
         detail.append(f"Nothing flagged among the newest {n_headlines} of {feed['available']} headlines, but "
                       "the cap on headlines left out the oldest, so check by hand.")
@@ -1518,7 +1523,7 @@ def feed_block(fid):
                       "the Headlines section).")
     if feed["error"] and not flagged:
         detail.append("Some searches failed, so stories may be missing: check by hand.")
-    crossed = True if flagged else (None if unjudged or feed["error"] or feed["capped"] else False)
+    crossed = True if linked else (None if flagged or unjudged or feed["error"] or feed["capped"] else False)
     return out, crossed, " ".join(detail)
 
 

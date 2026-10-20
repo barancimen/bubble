@@ -131,17 +131,17 @@ class Spreads(unittest.TestCase):
 
 
 class WeakBorrowers(unittest.TestCase):
-    def test_falling_together_while_market_holds_up_crosses(self):
+    def test_falling_together_while_market_holds_up_warns(self):
         def closes(ticker, span="1y"):
             start = 100.0
             end = 99.0 if ticker in ("QQQ", "ORCL") else 70.0
             return [(str(date(2026, 1, 1) + timedelta(days=i)), start if i < 60 else end) for i in range(80)]
         with mock.patch.object(b, "yahoo_closes", side_effect=closes):
-            self.assertIn("CROSSED", b.block_weak_borrowers())
+            self.assertIn("WARNING", b.block_weak_borrowers())
         def calm(ticker, span="1y"):
             return [(str(date(2026, 1, 1) + timedelta(days=i)), 100.0) for i in range(80)]
         with mock.patch.object(b, "yahoo_closes", side_effect=calm):
-            self.assertIn("Not crossed", b.block_weak_borrowers())
+            self.assertIn("No warning", b.block_weak_borrowers())
 
 
 class OraclePrepayments(unittest.TestCase):
@@ -179,7 +179,7 @@ class Quarterly(unittest.TestCase):
         with mock.patch.object(b, "sec_concept", return_value=facts):
             page = b.block_nvidia()
         self.assertIn("Check by hand", page)
-        self.assertNotIn("CROSSED", page)
+        self.assertNotIn("WARNING", page)
 
 
 class HeadlineCap(unittest.TestCase):
@@ -203,6 +203,16 @@ class HeadlineCap(unittest.TestCase):
         feeds["B"]["capped"] = False
         with mock.patch.object(b, "headlines", return_value=(feeds, "")):
             self.assertIs(b.feed_block("B")[1], False)
+
+    def test_only_flagged_stories_with_a_link_count(self):
+        story = {"headlines": [{"date": "2026-10-19", "link": "#", "title": "t", "when": None}],
+                 "verdict": "alert", "reason": "r", "new": False}
+        feeds = {"C": {"stories": [story], "error": None, "capped": False, "available": 1}}
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            self.assertIsNone(b.feed_block("C")[1])
+        story["headlines"][0]["link"] = "https://example.com/a"
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            self.assertIs(b.feed_block("C")[1], True)
 
 
 class Stores(unittest.TestCase):
