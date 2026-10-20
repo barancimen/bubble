@@ -153,8 +153,56 @@ class OraclePrepayments(unittest.TestCase):
         with mock.patch.object(b, "load_json_store", return_value=store), \
                 mock.patch.object(b, "save_json_store"), mock.patch.object(b, "fetch_json", return_value=empty):
             q = b.oracle_prepayments()
-        self.assertEqual(q["2026-08-31"], 11363e6)
-        self.assertEqual(q["2026-05-31"], 4592e6)  # nothing earlier in the fiscal year
+        self.assertEqual(q["2026-08-31"], (11363e6, "2026-06-01"))
+        self.assertEqual(q["2026-05-31"], (4592e6, "2025-06-01"))  # nothing earlier: covers the whole year
+
+    def test_remainder_starts_after_the_latest_earlier_figure(self):
+        store = {"q1": {"period": "2025-08-31", "form": "10-Q", "facts": [["2025-06-01", "2025-08-31", 0.0]]},
+                 "q2": {"period": "2026-11-30", "form": "10-Q", "facts": [["2025-06-01", "2025-11-30", 1e9]]},
+                 "k": {"period": "2026-05-31", "form": "10-K", "facts": [["2025-06-01", "2026-05-31", 4592e6]]}}
+        empty = {"filings": {"recent": {"form": [], "accessionNumber": [], "reportDate": []}}}
+        with mock.patch.object(b, "load_json_store", return_value=store), \
+                mock.patch.object(b, "save_json_store"), mock.patch.object(b, "fetch_json", return_value=empty):
+            q = b.oracle_prepayments()
+        self.assertEqual(q["2025-11-30"], (1e9, "2025-09-01"))
+        self.assertEqual(q["2026-05-31"], (3592e6, "2025-12-01"))  # the first half is taken out
+
+
+class Quarterly(unittest.TestCase):
+    def test_consecutive(self):
+        self.assertTrue(b.consecutive(["2025-09-30", "2025-12-31", "2026-03-31"]))
+        self.assertFalse(b.consecutive(["2025-09-30", "2026-03-31", "2026-06-30"]))
+
+    def test_nvidia_with_a_missing_quarter_is_checked_by_hand(self):
+        facts = [{"start": s, "end": e, "val": v, "filed": "2026-08-01"} for s, e, v in
+                 [("2025-07-01", "2025-09-30", 50e9), ("2026-01-01", "2026-03-31", 40e9)]]
+        with mock.patch.object(b, "sec_concept", return_value=facts):
+            page = b.block_nvidia()
+        self.assertIn("Check by hand", page)
+        self.assertNotIn("CROSSED", page)
+
+
+class HeadlineCap(unittest.TestCase):
+    def test_small_feeds_keep_everything(self):
+        q = b.feed_quotas({"A": 18, "B": 62, "C": 670, "D": 321, "E": 2, "F": 16}, 499)
+        self.assertEqual((q["A"], q["B"], q["E"], q["F"]), (18, 62, 2, 16))
+        self.assertEqual(sum(q.values()), 499)
+        self.assertLessEqual(abs(q["C"] - q["D"]), 1)
+
+    def test_under_the_cap_nothing_is_dropped(self):
+        self.assertEqual(b.feed_quotas({"A": 1, "B": 8}, 10), {"A": 1, "B": 8})
+
+    def test_capped_feed_with_nothing_flagged_is_not_clear(self):
+        story = {"headlines": [{"date": "2026-10-19", "link": "#", "title": "t", "when": None}],
+                 "verdict": "ok", "reason": "", "new": False}
+        feeds = {"B": {"stories": [story], "error": None, "capped": True, "available": 62}}
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            _, crossed, detail = b.feed_block("B")
+        self.assertIsNone(crossed)
+        self.assertIn("1 of 62", detail)
+        feeds["B"]["capped"] = False
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            self.assertIs(b.feed_block("B")[1], False)
 
 
 class Stores(unittest.TestCase):

@@ -206,6 +206,11 @@ def days_between(a, b):
     return (date.fromisoformat(b) - date.fromisoformat(a)).days
 
 
+def consecutive(ends):
+    """True when each quarter end follows the one before by one quarter (none missing)."""
+    return all(80 <= days_between(a, b) <= 100 for a, b in zip(ends, ends[1:]))
+
+
 def quarterly_flows(facts):
     """Quarterly values from flow facts. 10-Q cash-flow statements are
     year-to-date, so a quarter is the difference of two YTD figures."""
@@ -514,10 +519,12 @@ ORACLE_PREPAID = "IncreaseDecreaseInDeferredRevenuesFromCustomerPrepaymentsWithS
 
 
 def oracle_prepayments():
-    """{quarter end: customer prepayments with a significant financing component} that Oracle counts
-    in operating cash flow. The line is in Oracle's own XBRL extension, which the SEC's API leaves
-    out, so it is read from each filing's XBRL instance once and remembered. Quarters before the line
-    first appeared count as zero."""
+    """{quarter end: (customer prepayments with a significant financing component, first day they
+    cover)} that Oracle counts in operating cash flow. The line is in Oracle's own XBRL extension,
+    which the SEC's API leaves out, so it is read from each filing's XBRL instance once and
+    remembered. Quarters before the line first appeared count as zero. Where the earlier quarters of
+    a fiscal year weren't tagged, the remainder of the year-to-date figure is posted to its last
+    quarter but covers from the first day after the latest earlier figure."""
     store = load_json_store(ORACLE_STORE)
     sub = fetch_json("https://data.sec.gov/submissions/CIK0001341439.json", SEC_UA)["filings"]["recent"]
     for i, form in enumerate(sub["form"]):
@@ -546,25 +553,42 @@ def oracle_prepayments():
     out = {}
     for (s0, e), v in ytd.items():
         if days_between(s0, e) <= 100:
-            out[e] = v
+            out[e] = (v, s0)
             continue
-        prev = [v2 for (s2, e2), v2 in ytd.items() if s2 == s0 and 80 <= days_between(e2, e) <= 100]
-        out[e] = v - (prev[0] if prev else 0)  # no earlier figure this fiscal year: the line was zero
+        prev = max(((e2, v2) for (s2, e2), v2 in ytd.items() if s2 == s0 and e2 < e), default=None)
+        if prev is None:  # no earlier figure this fiscal year: it covers the whole year so far
+            out[e] = (v, s0)
+        else:
+            out[e] = (v - prev[1], (date.fromisoformat(prev[0]) + timedelta(days=1)).isoformat())
     return out
 
 
 def block_hyperscalers():
-    rows, panels, fcf_negative, capex_down, unknown, notes = [], [], [], [], [], ""
+    rows, panels, fcf_negative, fcf_unknown, capex_down, unknown, notes = [], [], [], [], [], [], ""
     for ticker, cik, capex_concept in HYPERSCALERS:
         ocf = quarterly_flows(sec_concept(cik, "NetCashProvidedByUsedInOperatingActivities"))
         capex = quarterly_flows(sec_concept(cik, capex_concept))
         lease = quarterly_flows(sec_concept_or_empty(cik, "FinanceLeasePrincipalPayments"))
-        prepaid = oracle_prepayments() if ticker == "ORCL" else {}
+        prepaid_spans = oracle_prepayments() if ticker == "ORCL" else {}
+        prepaid = {e: v for e, (v, _) in prepaid_spans.items()}
         ends = [e for e in capex if e in ocf]
         fcf = {e: ocf[e] - capex[e] - lease.get(e, 0) - prepaid.get(e, 0) for e in ends}
         last = ends[-1]
         notes += stale(last, f"{ticker} capex and cash flow")
-        ttm = sum(fcf[e] for e in ends[-4:]) if len(ends) >= 4 else None
+        ttm = None
+        if len(ends) < 4 or not consecutive(ends[-4:]):
+            notes += f" {ticker}'s last four filed quarters ({', '.join(ends[-4:])}) aren't consecutive, so its four-quarter free cash flow isn't shown."
+        elif any(v and days_between(s, ends[-4]) > 100 for e, (v, s) in prepaid_spans.items() if e in ends[-4:]):
+            notes += (f" {ticker}'s customer prepayments are tagged only for a period reaching back before "
+                      "the last four quarters, so its four-quarter free cash flow isn't shown.")
+        else:
+            ttm = sum(fcf[e] for e in ends[-4:])
+        untagged = [e for e in ends[-4:] if lease and e not in lease and e > min(lease)]
+        if untagged:
+            tagged = max(e for e in lease if e < untagged[0])
+            notes += (f" {ticker} hasn't tagged finance-lease repayments for the quarters ending "
+                      f"{' and '.join(untagged)}, so they count as zero here (${lease[tagged] / 1e9:,.2f}B in the "
+                      f"quarter ending {tagged}).")
         yoys = []
         for e in ends[-2:]:
             prior = year_earlier(capex, e)
@@ -573,7 +597,9 @@ def block_hyperscalers():
             unknown.append(ticker)
         elif all(y < 0 for y in yoys):
             capex_down.append(ticker)
-        if ttm is not None and ttm < 0:
+        if ttm is None:
+            fcf_unknown.append(ticker)
+        elif ttm < 0:
             fcf_negative.append(ticker)
         last6 = ends[-6:]
         panels.append((ticker, last6, [capex[e] / 1e9 for e in last6], [fcf[e] / 1e9 for e in last6]))
@@ -582,6 +608,10 @@ def block_hyperscalers():
                       f"(${sum(prepaid.get(e, 0) for e in ends[-4:]) / 1e9:,.1f}B over the last four quarters) are "
                       "taken out of operating cash flow: Oracle counts them there, but they are customers "
                       "funding Oracle's build-out, not cash its business generated.")
+            for e, (v, s) in prepaid_spans.items():
+                if v and e in last6 and days_between(s, e) > 100:
+                    notes += (f" Oracle tagged these prepayments for {s} to {e} only as a total "
+                              f"(${v / 1e9:,.1f}B); the chart shows all of it in the quarter ending {e}.")
         rows.append([ticker, esc(last), billions(ttm, True) if ttm is not None else "n/a",
                      " / ".join(pct(y, True) for y in yoys)])
     lo = min(0, *(min(f) for *_, f in panels))
@@ -613,7 +643,9 @@ def block_hyperscalers():
         "with working capital and the seasons (Amazon's first quarter is often negative), so they "
         "don't count on their own. Ares pointed to Alphabet and Amazon posting negative free cash "
         "flow in a recent quarter.",
-        bool(fcf_negative), f"Negative over the last four quarters: {', '.join(fcf_negative)}." if fcf_negative else "")
+        True if fcf_negative else (None if fcf_unknown else False),
+        (f"Negative over the last four quarters: {', '.join(fcf_negative)}." if fcf_negative else "")
+        + (f" No four-quarter figure for {', '.join(fcf_unknown)}, so check by hand." if fcf_unknown else ""))
     out += ('<p class="muted">Free cash flow here = operating cash flow − purchases of property and '
             "equipment − principal repayments of finance leases (where reported), as filed; this is "
             "Meta's own definition. Amazon's headline figure nets proceeds from asset sales against "
@@ -625,7 +657,8 @@ def block_hyperscalers():
 def block_nvidia():
     rev = quarterly_flows(sec_concept(NVDA_CIK, "Revenues"))
     ends = list(rev)[-6:]
-    change = (rev[ends[-1]] / rev[ends[-2]] - 1) * 100
+    gap = not consecutive(ends[-2:])
+    change = None if gap else (rev[ends[-1]] / rev[ends[-2]] - 1) * 100
     out = ('<p class="muted">Quarterly revenue by quarter-end month, $B. Hover a bar for its '
            'exact value.</p><div style="max-width:480px">'
            + column_chart(ends, [("Revenue", SERIES[0], [rev[e] / 1e9 for e in ends])], money_b,
@@ -634,22 +667,27 @@ def block_nvidia():
                 "a sequential drop means buyers are slowing down. Nvidia also guides the next "
                 "quarter's revenue in its results (late February, May, August and November); a guide "
                 "below the latest quarter is an earlier warning than this line.",
-                change < 0, f"Latest quarter vs previous: {pct(change, True)}." + stale(ends[-1], "Nvidia revenue"))
+                None if gap else change < 0,
+                (f"The latest two filed quarters ({ends[-2]} and {ends[-1]}) aren't consecutive, so check by hand."
+                 if gap else f"Latest quarter vs previous: {pct(change, True)}.") + stale(ends[-1], "Nvidia revenue"))
     return out + source("SEC EDGAR XBRL filings (Nvidia)",
                         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
 
 
 def block_backlog():
-    rows, crossed, panels, dips, notes = [], [], [], [], ""
+    rows, crossed, unknown, panels, dips, notes = [], [], [], [], [], ""
     for ticker, cik in BACKLOG:
         rpo = point_in_time(sec_concept(cik, "RevenueRemainingPerformanceObligation"))
         ends = list(rpo)
-        q = [(rpo[e] / rpo[p] - 1) * 100 for p, e in zip(ends, ends[1:])]
+        q = [(rpo[e] / rpo[p] - 1) * 100 if consecutive([p, e]) else None  # None: a quarter is missing
+             for p, e in zip(ends, ends[1:])]
         prior = year_earlier(rpo, ends[-1])
         yoy = (rpo[ends[-1]] / prior - 1) * 100 if prior else None
-        if (yoy is not None and yoy < 0) or (len(q) >= 2 and q[-1] < 0 and q[-2] < 0):
+        if (yoy is not None and yoy < 0) or (len(q) >= 2 and None not in q[-2:] and q[-1] < 0 and q[-2] < 0):
             crossed.append(ticker)
-        worst = min(zip(q, ends[1:]), default=None)
+        elif None in q[-2:]:
+            unknown.append(ticker)
+        worst = min(((c, e) for c, e in zip(q, ends[1:]) if c is not None), default=None)
         if worst and worst[0] < 0:
             dips.append(f"{ticker} {worst[0]:.1f}% ({date.fromisoformat(worst[1]):%b %Y})")
         notes += stale(ends[-1], f"{ticker} backlog")
@@ -670,7 +708,10 @@ def block_backlog():
         "or renegotiated. A single quarterly dip isn't enough: backlog is worked off as it is "
         "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
         "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
-        bool(crossed), (f"Crossed: {', '.join(crossed)}." if crossed else "") + notes)
+        True if crossed else (None if unknown else False),
+        (f"Crossed: {', '.join(crossed)}." if crossed else "")
+        + (f" A quarter is missing from {', '.join(unknown)}'s latest filed figures, so check by hand." if unknown else "")
+        + notes)
     return out + source("SEC EDGAR XBRL filings (remaining performance obligations)",
                         "https://www.sec.gov/edgar/search/")
 
@@ -1180,9 +1221,24 @@ def save_store(store):
     save_json_store(HEADLINE_STORE, store)
 
 
+def feed_quotas(available, limit):
+    """{feed: how many headlines it may keep}: feeds with no more than an equal share of the cap
+    keep everything, and the busier ones split what is left evenly."""
+    quota, left = {}, dict(available)
+    while left:
+        room = limit - sum(quota.values())
+        small = {f: n for f, n in left.items() if n <= room // len(left)}
+        if not small:
+            for i, f in enumerate(left):
+                quota[f] = room // len(left) + (i < room % len(left))
+            break
+        quota.update(small)
+        left = {f: n for f, n in left.items() if f not in small}
+    return quota
+
+
 def cap_round_robin(lists, limit):
-    """Takes items newest-first from each list in turn, so no feed or date slice
-    is starved."""
+    """Takes items newest-first from each list in turn, so no date slice is starved."""
     picked = [[] for _ in lists]
     total = 0
     while total < limit and any(len(p) < len(l) for p, l in zip(picked, lists)):
@@ -1253,13 +1309,15 @@ def headlines():
     and judges new headlines in a single DeepSeek call. Results are remembered, so
     each headline is judged once; a story that gains REJUDGE_MIN_NEW reports after it was
     judged is judged again. Returns ({feed id: {"stories": [...], "error": str or None,
-    "capped": bool}}, status note)."""
+    "capped": bool, "available": int}}, status note)."""
     today = TODAY.isoformat()
     store = load_store(today)
     known, stories = store["items"], store["stories"]
 
-    # One bucket per feed and date slice, so the cap trims evenly across both.
-    buckets, errors, taken, available = [], {fid: [] for fid in FEEDS}, set(), {fid: 0 for fid in FEEDS}
+    # One bucket per feed and date slice. Each feed gets a fair share of the cap (not one in
+    # proportion to how many slices its searches hit), and its slices share that evenly.
+    buckets, errors, taken = {fid: [] for fid in FEEDS}, {fid: [] for fid in FEEDS}, set()
+    available = {fid: 0 for fid in FEEDS}
     for fid, _, queries, _, _ in HEADLINE_FEEDS:
         for q in queries:
             try:
@@ -1275,8 +1333,9 @@ def headlines():
                         taken.add(k)
                         bucket.append(dict(h, key=k, feed=fid))
                 available[fid] += len(bucket)
-                buckets.append(bucket)
-    picked = [h for b in cap_round_robin(buckets, MAX_HEADLINES) for h in b]
+                buckets[fid].append(bucket)
+    quotas = feed_quotas(available, MAX_HEADLINES)
+    picked = [h for fid, bs in buckets.items() for b in cap_round_robin(bs, quotas[fid]) for h in b]
 
     current = lambda sid, fid: (sid in stories and stories[sid]["feed"] == fid
                                 and stories[sid]["criteria"] == criteria_hash(fid))
@@ -1389,7 +1448,8 @@ def headlines():
                         "reason": s_["reason"] if s_ else "", "latest": hs[-1]["when"],
                         "new": first_seen == today and today != store["created"] and fresh})
         out.sort(key=lambda g: g["latest"], reverse=True)
-        feeds[fid] = {"stories": out, "error": "; ".join(errors[fid]) or None, "capped": fid in capped}
+        feeds[fid] = {"stories": out, "error": "; ".join(errors[fid]) or None, "capped": fid in capped,
+                      "available": available[fid]}
 
     cutoff = (TODAY - timedelta(days=STORE_DAYS)).isoformat()
     store["items"] = {k: v for k, v in known.items() if v.get("last_seen", "") >= cutoff}
@@ -1448,6 +1508,9 @@ def feed_block(fid):
         detail.append(f"{len(flagged)} flagged {'story' if len(flagged) == 1 else 'stories'} "
                       f"({sum(s['new'] for s in flagged)} new today). The model can be wrong; "
                       "read them.")
+    elif items and not unjudged and feed["capped"]:
+        detail.append(f"Nothing flagged among the newest {n_headlines} of {feed['available']} headlines, but "
+                      "the cap on headlines left out the oldest, so check by hand.")
     elif items and not unjudged:
         detail.append(f"Nothing flagged among {len(items)} stories.")
     if unjudged:
@@ -1455,7 +1518,7 @@ def feed_block(fid):
                       "the Headlines section).")
     if feed["error"] and not flagged:
         detail.append("Some searches failed, so stories may be missing: check by hand.")
-    crossed = True if flagged else (None if unjudged or feed["error"] else False)
+    crossed = True if flagged else (None if unjudged or feed["error"] or feed["capped"] else False)
     return out, crossed, " ".join(detail)
 
 
@@ -1784,17 +1847,17 @@ def block_news():
 
 
 SECTIONS = [
-    ("1. Capex and income", [
+    ("1. Credit", [
+        ("Corporate bond spreads", block_spreads),
+        ("Credit default swaps: market-implied default probability", block_cds),
+        ("Most heavily borrowed AI names (stock prices)", block_weak_borrowers),
+    ]),
+    ("2. Capex and income", [
         ("Hyperscaler capex and free cash flow", block_hyperscalers),
         ("Nvidia revenue", block_nvidia),
         ("Contract backlog at Oracle, Microsoft and Alphabet", block_backlog),
         ("GPU rental prices", block_gpu_prices),
         ("Commitments not on the balance sheet", block_commitments),
-    ]),
-    ("2. Credit", [
-        ("Corporate bond spreads", block_spreads),
-        ("Credit default swaps: market-implied default probability", block_cds),
-        ("Most heavily borrowed AI names (stock prices)", block_weak_borrowers),
     ]),
     ("3. Insurance", [
         ("Annuity sales", block_annuities),
