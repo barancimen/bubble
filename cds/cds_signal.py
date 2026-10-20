@@ -5,39 +5,63 @@ Trade prints come from DTCC's free public security-based swap dissemination
 cds.py), so each run downloads only the days it hasn't seen.
 Standard library only.
 
-Method: for each fresh standard-coupon trade with 4-6 years left, solve for the
-constant default rate (hazard) that prices its up-front payment, assuming 40%
-recovery and a flat 3.75% risk-free rate; 5-year default probability is then
-1 - exp(-5 * hazard). Trades are pooled by month: median, with a 90% bootstrap
-interval. The latest month is also priced at 30% and 50% recovery, since the result
-is sensitive to that assumption. Used by the AI bubble dashboard (../bubble_watch.py).
+Method: for each fresh US-dollar standard-coupon trade on the company's own credit with
+4.5-5.5 years left (legs of credit-index trades are dropped), solve for the constant
+default rate (hazard) that prices it, assuming 40% recovery and a flat 3.75% risk-free
+rate; 5-year default probability is then 1 - exp(-5 * hazard). A trade prices from its
+quoted spread, or from its up-front payment: DTCC reports that as net cash (the clean
+up-front minus the accrued coupon the seller hands back) without saying who paid it,
+which is worked out from quotes and from the way prices behave across coupon dates
+(see _sides). Trades are pooled by month: median, with a 90% interval from resampling
+whole trading days. The latest month is also priced at 30% and 50% recovery, since the
+result is sensitive to that assumption. Used by the AI bubble dashboard
+(../bubble_watch.py); cds/CDS_VALIDATION.md checks it against published levels.
 """
+import bisect
 import csv
 import io
 import json
 import math
 import os
 import random
+import re
 import statistics as st
 import urllib.error
 import urllib.request
 import zipfile
+from collections import Counter, namedtuple
 from datetime import date, timedelta
 from html import escape as esc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, "dtcc_cache")  # shared with cds.py
 MISSING = os.path.join(HERE, "dtcc_missing.json")  # weekdays with no file (holidays)
+PUBLISHED = os.path.join(HERE, "published_levels.csv")  # levels reported in the press
 URL = "https://pddata.dtcc.com/ppd/api/report/cumulative/sec/SEC_CUMULATIVE_CREDITS_{d}.zip"
 
-NAMES = {"CRWV": "COREWEAVE", "ORCL": "ORACLE", "NVDA": "NVIDIA"}  # ticker -> reference entity
+# How DTCC identifies each reference entity: its RED code (first six characters of a RED pair code),
+# the ISIN of its standard reference bond, and a name to fall back on. Another entity's RED code
+# (e.g. ORACLE SYSTEMS CORP, 6EC42I) is never matched, whatever its name says.
+ENTITIES = {
+    "CRWV": dict(name="COREWEAVE", red="239FAV", isins={"US21873SAC26"}),
+    "ORCL": dict(name="ORACLE", red="6EC42L", isins={"US68389XBN49"}),
+    "NVDA": dict(name="NVIDIA", red="6D76CM", isins={"US67066GAN43"}),
+}
+NAMES = {t: e["name"] for t, e in ENTITIES.items()}  # ticker -> reference entity
 WINDOW_DAYS = 730          # charts span the last 24 months
 R, RATE = 0.4, 0.0375      # assumed recovery rate, flat risk-free rate
 HORIZON = 5                # years
+TENOR = (4.5, 5.5)         # years left on the contracts used: the 5-year point, not the 4-year one
 RECOVERY_RANGE = (0.3, 0.5)  # shown alongside R so the recovery assumption is visible
 NAME_COLUMNS = ("Underlying Asset Name", "UPI Underlier Name")
+ID_COLUMN, ID_SOURCE_COLUMN = "Underlier ID-Leg 1", "Underlier ID source-Leg 1"
 CURRENCY_COLUMN = "Notional currency-Leg 1"
 RESCALE_DAYS, RESCALE_SLACK = 10, 1.25  # see _rescaled_spread
+INDEX_LEG_COPIES = 20      # a payment repeated on this many lines of one file is an index trade
+IMM_PRE, IMM_POST = 5, 4   # days before/after a coupon date compared by _imm_tests
+EVIDENCE_GAP = 30          # days within which direction evidence counts as close
+MIN_DAYS = 3               # months with fewer trading days are shown as thin
+OUTLIER_RATIO, OUTLIER_DAYS = 3, 5  # see _drop_outliers
 
 
 # ---------- data ----------
@@ -88,14 +112,34 @@ def sync(today):
             if blob is not None:
                 _save(day, blob)
         day += timedelta(days=1)
-    with open(MISSING, "w") as f:
+    tmp = MISSING + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(sorted(d for d in missing if d >= start.isoformat()), f)
+    os.replace(tmp, MISSING)
+
+
+def _entity(row, idx):
+    """The ticker a row's reference entity belongs to, or None."""
+    uid = row[idx[ID_COLUMN]].strip().upper() if ID_COLUMN in idx and idx[ID_COLUMN] < len(row) else ""
+    src = row[idx[ID_SOURCE_COLUMN]].strip().upper() if ID_SOURCE_COLUMN in idx and idx[ID_SOURCE_COLUMN] < len(row) else ""
+    if uid and src == "REDID":
+        return next((t for t, e in ENTITIES.items() if uid[:6] == e["red"]), None)
+    if uid and src == "ISIN":
+        hit = next((t for t, e in ENTITIES.items() if uid in e["isins"]), None)
+        if hit:
+            return hit
+    elif uid and src:  # loan and other identifiers (e.g. CoreWeave's DDTL facilities) aren't CDS on the entity
+        return None
+    names = " | ".join(row[idx[c]] for c in NAME_COLUMNS if c in idx and idx[c] < len(row)).upper()
+    return next((t for t, e in ENTITIES.items() if e["name"] in names), None)
 
 
 def scan(today):
-    """{ticker: [row dict]} for every cached day in the window, each row tagged with file_date."""
+    """{ticker: [row dict]} for every cached day in the window, each row tagged with file_date and
+    index_leg (True when the row is one company's leg of a credit-index trade)."""
     start = today - timedelta(days=WINDOW_DAYS)
-    hits = {t: [] for t in NAMES}
+    hits = {t: [] for t in ENTITIES}
+    needles = [n for e in ENTITIES.values() for n in (e["name"], e["red"], *e["isins"])]
     for name in sorted(os.listdir(CACHE)):
         if not (name.startswith("SEC_CUMULATIVE_CREDITS_") and name.endswith(".zip")):
             continue
@@ -107,46 +151,81 @@ def scan(today):
             for member in z.namelist():
                 if not member.lower().endswith(".csv"):
                     continue
-                lines = z.read(member).decode("utf-8", "replace").splitlines()
+                text = z.read(member).decode("utf-8", "replace")
+                lines = text.splitlines()
                 header = next(csv.reader(lines[:1]))
-                # The entity is named in one of these columns (often only the UPI one). If a future
-                # schema drops both, fall back to searching the whole row rather than finding nothing.
-                cols = [header.index(c) for c in NAME_COLUMNS if c in header]
+                idx = {c: i for i, c in enumerate(header)}
                 if any(line.count('"') % 2 for line in lines):  # a quoted field spans lines
                     candidates = csv.reader(lines[1:])
-                else:  # parse only the lines that mention a name (about 1 in 100), much faster
-                    candidates = csv.reader(l for l in lines[1:] if any(n in l.upper() for n in NAMES.values()))
+                else:  # parse only the lines that mention a name or an identifier (~1 in 100)
+                    candidates = csv.reader(l for l in lines[1:] if any(n in l.upper() for n in needles))
+                found = []
                 for row in candidates:
-                    text = (" | ".join(row[i] for i in cols if i < len(row)) if cols else ",".join(row)).upper()
-                    for ticker, needle in NAMES.items():
-                        if needle in text:
-                            hits[ticker].append(dict(zip(header, row), file_date=day.isoformat()))
+                    ticker = _entity(row, idx)
+                    if ticker:
+                        found.append((ticker, dict(zip(header, row), file_date=day.isoformat())))
+                # An index trade (e.g. CDX) is disseminated as one leg per company, each with the
+                # same payment: a payment repeated across many lines is an index leg, not a price
+                # for this company's own credit.
+                pays = {r.get("Other payment amount") for _, r in found} - {"", None}
+                copies = Counter(re.findall("|".join(re.escape(f'"{p}"') for p in pays), text)) if pays else {}
+                for ticker, r in found:
+                    r["index_leg"] = copies.get(f'"{r.get("Other payment amount")}"', 0) >= INDEX_LEG_COPIES
+                    hits[ticker].append(r)
     return hits
 
 
-def _last_coupon_date(d):
-    for y in (d.year, d.year - 1):
+def _imm(y, m):
+    """Standard CDS coupon date: the 20th of Mar/Jun/Sep/Dec, moved to Monday if on a weekend."""
+    d = date(y, m, 20)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _accrual_start(stepin):
+    """The coupon date on or before the step-in date (trade date + 1), where accrual restarts."""
+    for y in (stepin.year, stepin.year - 1):
         for m in (12, 9, 6, 3):
-            if date(y, m, 20) < d:
-                return date(y, m, 20)
+            if _imm(y, m) <= stepin:
+                return _imm(y, m)
 
 
-def _flat_upfront(h, T, coupon, rec=R):
-    """Protection leg minus running-coupon premium leg at constant hazard h, monthly grid."""
-    n = max(1, int(T * 12)); dt = T / n; prot = prem = 0
+def _accrued(trade, coupon):
+    """Accrued coupon at the trade, as a fraction of notional (actual/360 to the step-in date)."""
+    stepin = trade + timedelta(days=1)
+    return coupon * (stepin - _accrual_start(stepin)).days / 360
+
+
+def _legs(h, T, rec=R):
+    """(protection leg, risky annuity) at constant hazard h, monthly grid."""
+    n = max(1, int(T * 12)); dt = T / n; prot = ann = 0
     for i in range(1, n + 1):
         t = i * dt; df = math.exp(-RATE * t)
         s0, s1 = math.exp(-h * (t - dt)), math.exp(-h * t)
-        prot += (1 - rec) * df * (s0 - s1); prem += coupon * dt * df * (s0 + s1) / 2
-    return prot - prem
+        prot += (1 - rec) * df * (s0 - s1); ann += dt * df * (s0 + s1) / 2
+    return prot, ann
+
+
+def _flat_upfront(h, T, coupon, rec=R):
+    """Clean up-front (fraction of notional) of a contract paying coupon, at constant hazard h."""
+    prot, ann = _legs(h, T, rec)
+    return prot - coupon * ann
 
 
 def _implied_hazard(u, T, coupon, rec=R):
     lo, hi = 0.0, 2.0
-    for _ in range(50):
+    for _ in range(32):  # ~5e-10 hazard precision, far below anything that shows
         mid = (lo + hi) / 2
         lo, hi = (mid, hi) if _flat_upfront(mid, T, coupon, rec) < u else (lo, mid)
     return mid
+
+
+def par_spread(h, T=HORIZON, rec=R):
+    """The running spread that prices a contract at zero up-front at hazard h (for 5 years by
+    default): what press reports call a company's CDS spread."""
+    prot, ann = _legs(h, T, rec)
+    return prot / ann
 
 
 def _rescaled_spread(s, day, valid):
@@ -161,16 +240,109 @@ def _rescaled_spread(s, day, valid):
     return None
 
 
-def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
+def _spread_bp(side, u, rec):
+    """Par spread (bp) of an up-front trade u = (base, |net cash|, accrued) if side paid the net cash."""
+    base, paid, acc = u
+    return par_spread(_implied_hazard(side * paid + acc, base["T"], base["coupon"], rec), base["T"], rec) * 1e4
+
+
+def _imm_tests(ups, rec):
+    """{coupon date: side} for one coupon's up-front trades, where the data decide it.
+    DTCC reports the net cash (the clean up-front minus the accrued coupon the seller hands back)
+    without saying who paid it. Accrual restarts on each coupon date: read the right way, prices
+    run straight through it; read the wrong way they jump by about twice the accrued coupon. The
+    last few days before and the first few after are compared, so that real market moves stay
+    small, and a test decides only if one reading jumps at most 2/3 as much as the other."""
+    out = {}
+    if not ups:
+        return out
+    days = sorted(u[0]["trade"] for u in ups)
+    y, m = days[0].year, days[0].month
+    while (y, m) <= (days[-1].year, days[-1].month):
+        if m % 3 == 0:
+            d0 = _imm(y, m)
+            stepin = lambda u: u[0]["trade"] + timedelta(days=1)
+            pre = [u for u in ups if d0 - timedelta(days=IMM_PRE) <= stepin(u) < d0]
+            post = [u for u in ups if d0 <= stepin(u) <= d0 + timedelta(days=IMM_POST)]
+            if len(pre) >= 2 and len(post) >= 2:
+                jump = {side: abs(st.median(_spread_bp(side, u, rec) for u in post)
+                                  - st.median(_spread_bp(side, u, rec) for u in pre)) for side in (1, -1)}
+                small, big = sorted(jump, key=jump.get)
+                if jump[small] <= 2 / 3 * jump[big]:
+                    out[d0] = small
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def _sides(quotes, ups, coupon, rec):
+    """[side] for one coupon's up-front trades: +1 if the buyer paid the net cash, -1 if the seller
+    did, None if the data don't say. A trade where only one reading is possible is settled by
+    that. Evidence for the others: quoted spreads (whoever pays the net cash at that spread) and
+    coupon-date tests; a quote within EVIDENCE_GAP days overrules a test that disagrees with it. Evidence on both sides of a trade that agrees settles it; where it
+    disagrees, the side flips on the day the net cash came closest to zero. A trade with evidence
+    on one side only is settled if that evidence is within EVIDENCE_GAP days."""
+    # A reading that needs a negative default rate (or more than certain default) is impossible,
+    # which settles that trade. It isn't evidence for others: a garbled print looks the same.
+    forced = {}
+    for k, (base, paid, acc) in enumerate(ups):
+        if acc - paid <= _flat_upfront(0.0, base["T"], coupon, rec):
+            forced[k] = 1
+        elif paid + acc >= _flat_upfront(2.0, base["T"], coupon, rec):
+            forced[k] = -1
+    evidence = []  # (date, side)
+    for base, s in quotes:
+        u_ref = _flat_upfront(_implied_hazard(0, HORIZON, s, rec), HORIZON, coupon, rec)
+        evidence.append((base["trade"], 1 if u_ref - _accrued(base["trade"], coupon) > 0 else -1))
+    quoted = list(evidence)
+    for d0, side in _imm_tests(ups, rec).items():
+        if not any(abs((d0 - d).days) <= EVIDENCE_GAP and qs != side for d, qs in quoted):
+            evidence.append((d0, side))
+    evidence.sort()
+    if not evidence:
+        return [forced.get(k) for k in range(len(ups))]
+    ev_days = [d for d, _ in evidence]
+    by_day = {}
+    for base, paid, _ in ups:
+        by_day.setdefault(base["trade"], []).append(paid / base["T"])
+    net = {d: st.median(v) for d, v in by_day.items()}  # net cash per year of maturity
+    out = []
+    for k, (base, _, _) in enumerate(ups):
+        if k in forced:
+            out.append(forced[k])
+            continue
+        day = base["trade"]
+        i = bisect.bisect_right(ev_days, day)  # evidence[i - 1] is on or before the trade
+        before = evidence[i - 1] if i else None
+        after = evidence[i] if i < len(evidence) else None
+        if before and after and before[1] != after[1]:
+            between = [d for d in net if before[0] < d < after[0]]
+            flip = min(between, key=net.get) if between else after[0]
+            out.append(before[1] if day < flip else after[1])
+        elif before and after:
+            out.append(before[1])
+        else:
+            ev = before or after
+            out.append(ev[1] if abs((ev[0] - day).days) <= EVIDENCE_GAP else None)
+    return out
+
+
+def resolve(rows, start, lo=TENOR[0], hi=TENOR[1], rec=R, since=None):
     """One ticker's raw rows -> priced trades with lo <= years left <= hi, as dicts: trade and
     file_date (dates), maturity, T (years left), coupon, upfront (signed clean up-front, fraction
-    of notional), hazard (flat default rate pricing the trade), anchored (direction from a quote).
+    of notional), hazard (flat default rate pricing the trade), anchored (False when the data don't
+    say who paid the up-front: then hazard assumes the buyer paid and hazard_alt the seller).
     rec is the assumed recovery rate. since (a date) limits the output, and the pricing work, to
-    trades on or after it; direction anchors still come from the whole window."""
+    trades on or after it; direction evidence still comes from the whole window."""
     errored = {r.get("Original Dissemination Identifier") for r in rows if r.get("Action type") == "EROR"}
+    # Only fresh trades are prices: new trades (event TRAD) and corrections of them. Novations,
+    # modifications and terminations carry fees on existing trades, not today's price.
+    not_fresh = {r.get("Dissemination Identifier") for r in rows
+                 if r.get("Action type") == "NEWT" and r.get("Event type", "TRAD") not in ("TRAD", "")}
     latest = {}
     for r in sorted(rows, key=lambda r: r["file_date"]):
-        if r.get("Action type") not in ("NEWT", "CORR", "MODI") or r.get("Fixed rate-Leg 1") not in ("0.01", "0.05"):
+        if r.get("Action type") not in ("NEWT", "CORR") or r.get("Fixed rate-Leg 1") not in ("0.01", "0.05"):
+            continue
+        if r.get("Dissemination Identifier") in not_fresh or r.get("Original Dissemination Identifier") in not_fresh:
             continue
         # EUR and blank-currency prints aren't comparable. Checked here rather than in scan, because
         # error cancellations (EROR) often have a blank currency and must still knock trades out.
@@ -179,12 +351,13 @@ def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
         key = r.get("Original Dissemination Identifier") or r.get("Dissemination Identifier")
         if key in errored or r.get("Dissemination Identifier") in errored:
             continue
-        latest[key] = r  # corrections/modifications overwrite originals
+        latest[key] = r  # corrections overwrite originals
     trades = []
     for r in latest.values():
+        if r.get("index_leg") is True:  # one leg of an index trade: the index's price, not this name's
+            continue
         try:
             trade = date.fromisoformat(r["Execution Timestamp"][:10])
-            eff = date.fromisoformat(r["Effective Date"])
             mat = date.fromisoformat(r["Expiration Date"])
             coupon = float(r["Fixed rate-Leg 1"])
         except (KeyError, ValueError):
@@ -196,7 +369,7 @@ def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
         if not lo <= T <= hi:
             continue
         base = dict(trade=trade, file_date=date.fromisoformat(r["file_date"]), maturity=mat, T=T, coupon=coupon)
-        trades.append((r, eff, base))
+        trades.append((r, base))
 
     # Some trades report a quoted spread instead of an up-front payment. They price directly
     # (up-front of zero at a coupon equal to the spread), whatever the trade size.
@@ -206,10 +379,10 @@ def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
         except ValueError:
             return math.nan
 
-    valid = [(base["trade"], spread(r)) for r, _, base in trades if 0.001 <= spread(r) <= 0.5]
+    valid = [(base["trade"], spread(r)) for r, base in trades if 0.001 <= spread(r) <= 0.5]
     quotes = []  # (base, spread)
-    upfronts = []  # (base, |reported up-front|, accrued), as fractions of notional
-    for r, eff, base in trades:
+    upfronts = []  # (base, |reported net cash|, accrued), as fractions of notional
+    for r, base in trades:
         s = spread(r)
         if not 0.001 <= s <= 0.5:  # a few prints carry values in other units
             s = _rescaled_spread(s, base["trade"], valid) or math.nan
@@ -219,54 +392,70 @@ def resolve(rows, start, lo=4, hi=6, rec=R, since=None):
         notional, upfront = r.get("Notional amount-Leg 1", ""), r.get("Other payment amount", "")
         if not notional or "+" in notional or not upfront:  # "5,000,000+" hides the real size
             continue
+        if r.get("Other payment type", "UFRO") != "UFRO":  # unwind fees and mixed payments aren't prices
+            continue
         try:
             n, paid = float(notional.replace(",", "")), abs(float(upfront))
         except ValueError:
             continue
-        accrued = base["coupon"] * (eff - _last_coupon_date(eff)).days / 360  # reported upfront includes it
-        upfronts.append((base, paid / n, accrued))
+        if paid == 0 or n == 0:  # a zero payment is a missing value, not a price
+            continue
+        upfronts.append((base, paid / n, _accrued(base["trade"], base["coupon"])))
 
-    # DTCC reports an up-front's size but not who paid it. When the spread is above the coupon
-    # the buyer pays; below it (e.g. Nvidia at ~40-90bp against a 100bp coupon) the seller does.
-    # The direction can only change when the spread crosses the coupon, which shows up as
-    # up-fronts near zero. So a quoted spread fixes the direction for trades on either side of
-    # it, up to the first day that looks like a crossing; past that, with no quote, assume the
-    # buyer pays and say so. Keep lo..hi narrow: a 1-year and a 5-year contract can sit on
-    # opposite sides of the coupon.
-    by_day = {}
-    for base, paid, accrued in upfronts:
-        by_day.setdefault(base["trade"], []).append(abs(paid - accrued) / base["T"])
-    crossings = sorted(d for d, v in by_day.items() if st.median(v) < 0.001)  # within 10bp/yr
-
-    def quote_side(day, coupon):
-        usable = [q for q in quotes
-                  if not any(min(q[0]["trade"], day) < c < max(q[0]["trade"], day) for c in crossings)]
-        if not usable:
-            return None
-        q = min(usable, key=lambda q: abs((q[0]["trade"] - day).days))
-        return 1 if q[1] > coupon else -1
+    # Who paid the up-front isn't reported: the clean up-front is paid + accrued if the buyer paid
+    # the net cash, accrued - paid if the seller did. _sides works it out per coupon where it can.
+    side_of = {}
+    for coupon in {base["coupon"] for base, *_ in upfronts}:
+        group = [u for u in upfronts if u[0]["coupon"] == coupon]
+        # Who paid is a fact about the trade, not about the recovery assumption: decide it at R.
+        for u, sa in zip(group, _sides(quotes, group, coupon, R)):
+            side_of[id(u)] = sa
 
     wanted = lambda base: since is None or base["trade"] >= since
     out = []
     for base, s in quotes:
         if wanted(base):
             h = _implied_hazard(0, base["T"], s, rec)
-            out.append(dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"], rec), hazard=h, anchored=True))
-    for base, paid, accrued in upfronts:
+            out.append(dict(base, upfront=_flat_upfront(h, base["T"], base["coupon"], rec), hazard=h,
+                            hazard_alt=h, anchored=True))
+    for item in upfronts:
+        base, paid, acc = item
         if not wanted(base):
             continue
-        side = quote_side(base["trade"], base["coupon"])
-        u = (side or 1) * paid - accrued
-        out.append(dict(base, upfront=u, hazard=_implied_hazard(u, base["T"], base["coupon"], rec),
-                        anchored=side is not None))
-    return out
+        side = side_of[id(item)]
+        u = (side or 1) * paid + acc
+        h = _implied_hazard(u, base["T"], base["coupon"], rec)
+        # Unresolved: keep the buyer-paid reading in upfront/hazard, and the seller-paid one too.
+        alt = h if side else _implied_hazard(acc - paid, base["T"], base["coupon"], rec)
+        out.append(dict(base, upfront=u, hazard=h, hazard_alt=alt, anchored=side is not None))
+    return _drop_outliers(out)
+
+
+def _drop_outliers(trades):
+    """Drops a settled trade priced more than OUTLIER_RATIO times above or below the median of at
+    least three other settled trades within OUTLIER_DAYS days: a garbled record, not a price."""
+    settled = sorted((t["trade"], t["hazard"], i) for i, t in enumerate(trades) if t["anchored"])
+    days = [d for d, _, _ in settled]
+    bad = set()
+    for d, h, i in settled:
+        lo = bisect.bisect_left(days, d - timedelta(days=OUTLIER_DAYS))
+        hi = bisect.bisect_right(days, d + timedelta(days=OUTLIER_DAYS))
+        others = [x for _, x, j in settled[lo:hi] if j != i]
+        if len(others) >= 3:
+            m = st.median(others)
+            if h > OUTLIER_RATIO * m or h * OUTLIER_RATIO < m:
+                bad.add(i)
+    return [t for i, t in enumerate(trades) if i not in bad]
 
 
 def trade_pds(rows, start, rec=R, since=None):
-    """[(trade date, 5y default probability, direction anchored by a quote)] from near-5y contracts
-    only (4-6 years left), so the curve's slope doesn't bias the estimate."""
-    return sorted((t["trade"], 1 - math.exp(-HORIZON * t["hazard"]), t["anchored"])
-                  for t in resolve(rows, start, 4, 6, rec, since))
+    """[(trade date, 5y default probability, settled, alternative)] from 5-year contracts only (TENOR
+    years left), so the curve's slope doesn't bias the estimate. When who paid the up-front isn't
+    settled, the probability assumes the buyer paid and the alternative that the seller did;
+    otherwise the two are equal."""
+    pd = lambda h: 1 - math.exp(-HORIZON * h)
+    return sorted((t["trade"], pd(t["hazard"]), t["anchored"], pd(t["hazard_alt"]))
+                  for t in resolve(rows, start, *TENOR, rec, since))
 
 
 def months(start, end):
@@ -276,59 +465,102 @@ def months(start, end):
         m = (m.replace(day=28) + timedelta(days=4)).replace(day=1)
 
 
+Month = namedtuple("Month", "month median lo hi n unresolved days mid last alt")
+
+
 def monthly(pts, start, end):
-    """[(month, median, ci_lo, ci_hi, n, assumed)] for every month in the window (median None when
-    the month has no trades); assumed is True when most trades' up-front direction was assumed."""
-    by_month, anchored = {}, {}
-    for d, p, a in pts:
-        by_month.setdefault(d.replace(day=1), []).append(p)
-        anchored.setdefault(d.replace(day=1), []).append(a)
+    """[Month] for every month in the window (median None when the month has no trades).
+    Settled months: median 5y default probability of the settled trades, with a 90% interval from
+    resampling whole trading days (prints on one day are not independent), the number of distinct
+    prints and of trading days, and the middle and last trade dates. A block trade split into
+    identical pieces counts once. Unresolved months (most trades unsettled): median is the reading
+    in which the buyers paid the up-fronts, alt the one in which the sellers did, lo/hi None."""
+    by_month = {}
+    for d, p, settled, alt in pts:
+        by_month.setdefault(d.replace(day=1), set()).add((d, round(p, 6), settled, round(alt, 6)))
     rng = random.Random(0)
     out = []
     for m in months(start, end):
-        v = by_month.get(m)
-        if not v:
-            out.append((m, None, None, None, 0, False))
+        trades = sorted(by_month.get(m, ()))
+        if not trades:
+            out.append(Month(m, None, None, None, 0, False, 0, None, None, None))
             continue
-        boots = sorted(st.median(rng.choices(v, k=len(v))) for _ in range(2000))
-        assumed = sum(anchored[m]) < len(v) / 2
-        out.append((m, st.median(v), boots[100], boots[1899], len(v), assumed))
+        dates = [d for d, *_ in trades]
+        mid, last, ndays = dates[len(dates) // 2], dates[-1], len(set(dates))
+        settled = [(d, p) for d, p, ok, _ in trades if ok]
+        if len(settled) * 2 < len(trades):
+            out.append(Month(m, st.median(p for _, p, _, _ in trades), None, None, len(trades), True,
+                             ndays, mid, last, st.median(a for *_, a in trades)))
+            continue
+        per_day = {}
+        for d, p in settled:
+            per_day.setdefault(d, []).append(p)
+        groups = list(per_day.values())
+        boots = sorted(st.median([p for g in rng.choices(groups, k=len(groups)) for p in g]) for _ in range(2000))
+        out.append(Month(m, st.median(p for _, p in settled), boots[100], boots[1899], len(settled), False,
+                         len(per_day), mid, last, None))
     return out
 
 
 def recovery_range(rows, start, month):
-    """{recovery rate: median 5y default probability in month} for R and each RECOVERY_RANGE rate."""
+    """{recovery rate: median 5y default probability of the settled trades in month} for R and each
+    RECOVERY_RANGE rate (None if none are settled)."""
     out = {}
     for rec in sorted({R, *RECOVERY_RANGE}):
-        v = [p for d, p, _ in trade_pds(rows, start, rec, since=month) if d.replace(day=1) == month]
-        out[rec] = st.median(v) if v else None
+        v = {(d, round(p, 6)) for d, p, ok, _ in trade_pds(rows, start, rec, since=month)
+             if ok and d.replace(day=1) == month}
+        out[rec] = st.median(p for _, p in v) if v else None
     return out
 
 
 def series(today, download=True):
-    """{ticker: (monthly series, recovery_range for its latest month with trades, or {})} after
+    """{ticker: ([Month], recovery_range for its latest month with trades, or {}, trade_pds)} after
     syncing the cache (download=False uses only the files already cached)."""
     start = today - timedelta(days=WINDOW_DAYS)
     if download:
         sync(today)
     out = {}
     for t, rows in scan(today).items():
-        data = monthly(trade_pds(rows, start), start, today)
-        have = [m for m, med, *_ in data if med is not None]
-        out[t] = (data, recovery_range(rows, start, have[-1]) if have else {})
+        pts = trade_pds(rows, start)
+        data = monthly(pts, start, today)
+        have = [s.month for s in data if s.median is not None]
+        out[t] = (data, recovery_range(rows, start, have[-1]) if have else {}, pts)
+    return out
+
+
+def estimate_near(pts, day, before=4, after=1):
+    """Median 5-year spread (bp) of the settled trades from `before` days before day to `after`
+    days after, and how many there were; (None, 0) if there are none."""
+    v = {(d, p) for d, p, ok, _ in pts if ok and day - timedelta(days=before) <= d <= day + timedelta(days=after)}
+    if not v:
+        return None, 0
+    return par_spread(-math.log(1 - st.median(p for _, p in v)) / HORIZON) * 1e4, len(v)
+
+
+def published_levels():
+    """{ticker: [dict(date, bp, source, url, note, role)]} from published_levels.csv: 5-year CDS
+    levels reported in the press, with their sources. role is "design" for levels looked at while
+    the method was built, "holdout" for ones found only after it was fixed."""
+    out = {t: [] for t in ENTITIES}
+    with open(PUBLISHED, newline="") as f:
+        for r in csv.DictReader(f):
+            if r["ticker"] in out:
+                out[r["ticker"]].append(dict(date=date.fromisoformat(r["date"]), bp=float(r["spread_bp"]),
+                                             source=r["source"], url=r["url"], note=r["note"], role=r["role"]))
     return out
 
 
 # ---------- chart ----------
 
 W, H = 960, 240
-ML, MR, MT, MB = 52, 64, 12, 28  # margins: left PD axis, right price axis, top, bottom month labels
-PD_COLOR, PRICE_COLOR = "#2a78d6", "#8f8d87"
+ML, MR, MT, MB = 64, 52, 12, 28  # margins: left price axis, right probability axis, top, bottom month labels
+PD_COLOR, NEWS_COLOR, PRICE_COLOR, GRID, TEXT = "#2a78d6", "#eb6834", "#8f8d87", "#e6e5e1", "#52514e"
 
 
-def _nice_pd_max(v):
+def nice_pd_max(v):
+    """(top, step) of a probability axis reaching at least v, with at most ten steps."""
     for step in (0.01, 0.02, 0.05, 0.1, 0.2):
-        top = math.ceil(v / step) * step
+        top = math.ceil(max(v, 0.01) / step) * step
         if top / step <= 10:
             return top, step
     return 1.0, 0.2
@@ -351,34 +583,38 @@ def _money(v):
     return f"${v:,.0f}" if v >= 10 else f"${v:g}"
 
 
-def svg_chart(ticker, data, closes, start, end):
-    """One ticker: monthly 5y default probability (left axis, from 0%) with the stock's daily
-    close on a log scale (right axis). Every chart gets the same start/end, so they line up."""
+def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
+    """One ticker: monthly 5y default probability from DTCC trades (right axis, from 0%, on the
+    scale top = (max, step) shared by every company so they can be compared), levels reported in
+    the news on the same axis (reported = [(date, probability, tooltip)]), and the stock's daily
+    close on a log scale (left axis). Each month's dot sits at the middle of its trade dates;
+    months with fewer than MIN_DAYS trading days are faded and not joined up; unresolved months
+    show both readings as a band."""
     pw, ph = W - ML - MR, H - MT - MB
     span = (end - start).days
     x = lambda d: ML + (d - start).days / span * pw
-    have = [s for s in data if s[1] is not None]
-    top, step = _nice_pd_max(max([s[3] for s in have] + [0.01]))
-    y = lambda p: MT + ph - p / top * ph
-
+    have = [s for s in data if s.median is not None]
+    top, step = top or nice_pd_max(max([s.hi or s.median for s in have] + [p for _, p, _ in reported] + [0.01]))
+    y = lambda p: MT + ph - min(p, top) / top * ph
     out = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" '
-           f'aria-label="{esc(ticker)} 5-year default probability by month, with stock price" '
+           f'aria-label="{esc(ticker)}: 5-year default probability by month from CDS trades and levels reported '
+           f'in the news (right axis), with the stock price (left axis)" '
            'style="font:11px system-ui,sans-serif;display:block">']
-    # PD grid and left labels
+    # default-probability grid and right labels
     for i in range(round(top / step) + 1):
         p = i * step; yy = y(p)
-        out.append(f'<line x1="{ML}" x2="{W - MR}" y1="{yy:.1f}" y2="{yy:.1f}" stroke="#e6e5e1"/>')
-        out.append(f'<text x="{ML - 6}" y="{yy + 4:.1f}" text-anchor="end" fill="#52514e">{p * 100:.0f}%</text>')
-    # a vertical line at each month start; labels (month and year) every second month, centred on
-    # the month like its dot
-    for i, (m, *_rest) in enumerate(data):
+        out.append(f'<line x1="{ML}" x2="{W - MR}" y1="{yy:.1f}" y2="{yy:.1f}" stroke="{GRID}"/>')
+        out.append(f'<text x="{W - MR + 6}" y="{yy + 4:.1f}" fill="{TEXT}">{p * 100:.0f}%</text>')
+    # a vertical line at each month start; month labels every second month
+    for i, s in enumerate(data):
+        m = s.month
         if m > start:
-            out.append(f'<line x1="{x(m):.1f}" x2="{x(m):.1f}" y1="{MT}" y2="{MT + ph}" stroke="#e6e5e1"/>')
-        if i % 2 == 0:
-            xx = x(m + timedelta(days=15))
-            out.append(f'<text x="{xx:.1f}" y="{H - 8}" text-anchor="middle" fill="#52514e">{m:%b} ’{m:%y}</text>')
+            out.append(f'<line x1="{x(m):.1f}" x2="{x(m):.1f}" y1="{MT}" y2="{MT + ph}" stroke="{GRID}"/>')
+        mid = max(m, start) + (min(m + timedelta(days=31), end) - max(m, start)) / 2
+        if i % 2 == 0 and x(mid) >= ML + 16 and x(mid) <= W - MR - 16:
+            out.append(f'<text x="{x(mid):.1f}" y="{H - 8}" text-anchor="middle" fill="{TEXT}">{m:%b} ’{m:%y}</text>')
 
-    # stock price, log scale, right axis
+    # stock price, log scale, left axis
     closes = [(d, c) for d, c in closes if start <= d <= end and c > 0]
     if closes:
         lo, hi = min(c for _, c in closes), max(c for _, c in closes)
@@ -387,29 +623,57 @@ def svg_chart(ticker, data, closes, start, end):
         pts = " ".join(f"{x(d):.1f},{yp(c):.1f}" for d, c in closes)
         out.append(f'<polyline points="{pts}" fill="none" stroke="{PRICE_COLOR}" stroke-width="1.5"/>')
         for v in _log_ticks(lo / 1.05, hi * 1.05):
-            out.append(f'<text x="{W - MR + 6}" y="{yp(v) + 4:.1f}" fill="#52514e">{_money(v)}</text>')
+            out.append(f'<text x="{ML - 6}" y="{yp(v) + 4:.1f}" text-anchor="end" fill="{TEXT}">{_money(v)}</text>')
 
-    # PD: median line (broken where a month has no trades), 90% interval, dots with tooltips
+    def period(s):
+        return (f"{s.month:%b} 1–{s.last.day}, {s.month:%Y}" if (s.last.year, s.last.month) == (end.year, end.month)
+                else f"{s.month:%b %Y}")
+
+    # DTCC estimate: a line through settled months with enough trading days, 90% interval, dots
     run = []
-    for m, med, lo, hi, n, _ in data + [(None, None, None, None, 0, False)]:
-        if med is None:
+    for s in data + [Month(None, None, None, None, 0, False, 0, None, None, None)]:
+        if s.median is None or s.unresolved or s.days < MIN_DAYS:
             if len(run) > 1:
                 out.append(f'<polyline points="{" ".join(run)}" fill="none" stroke="{PD_COLOR}" stroke-width="2"/>')
             run = []
             continue
-        xx = x(m + timedelta(days=15))
-        run.append(f"{xx:.1f},{y(med):.1f}")
-    for m, med, lo, hi, n, assumed in have:
-        xx = x(m + timedelta(days=15))
-        out.append(f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{y(hi):.1f}" y2="{y(lo):.1f}" '
+        run.append(f"{x(s.mid):.1f},{y(s.median):.1f}")
+    for s in have:
+        xx = x(s.mid)
+        days = f"{s.n} trade{'s' * (s.n != 1)} on {s.days} day{'s' * (s.days != 1)}"
+        thin = f"; only {s.days} trading day{'s' * (s.days != 1)}, treat with caution" if s.days < MIN_DAYS else ""
+        if s.unresolved:
+            out.append(f'<rect x="{xx - 5:.1f}" y="{y(s.median):.1f}" width="10" height="{max(y(s.alt) - y(s.median), 1):.1f}" '
+                       f'rx="5" fill="{PD_COLOR}" opacity="0.18"><title>{period(s)}: who paid the up-fronts isn\'t '
+                       f'settled by the data: {s.median * 100:.0f}% if the buyers paid them, {s.alt * 100:.0f}% if '
+                       f'the sellers did ({days}{thin})</title></rect>')
+            for v in (s.median, s.alt):
+                out.append(f'<circle cx="{xx:.1f}" cy="{y(v):.1f}" r="3" fill="#fff" stroke="{PD_COLOR}" stroke-width="1.5"/>')
+            continue
+        opacity = ' opacity="0.45"' if s.days < MIN_DAYS else ""
+        out.append(f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{y(s.hi):.1f}" y2="{y(s.lo):.1f}" '
                    f'stroke="{PD_COLOR}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>')
-        fill, ring = ("#fff", PD_COLOR) if assumed else (PD_COLOR, "#fff")
-        note = "; payment direction assumed, no recent quote" if assumed else ""
-        out.append(f'<circle cx="{xx:.1f}" cy="{y(med):.1f}" r="4" fill="{fill}" stroke="{ring}" stroke-width="2">'
-                   f'<title>{m:%b %Y}: {med * 100:.1f}% (90% interval {lo * 100:.1f}–{hi * 100:.1f}%, '
-                   f'{n} trade{"s" * (n != 1)}{note})</title></circle>')
-    if not have:
-        out.append(f'<text x="{ML + pw / 2}" y="{MT + ph / 2}" text-anchor="middle" fill="#52514e">'
+        out.append(f'<circle cx="{xx:.1f}" cy="{y(s.median):.1f}" r="4" fill="{PD_COLOR}" stroke="#fff" stroke-width="2"{opacity}>'
+                   f'<title>{period(s)}: {s.median * 100:.1f}% (90% interval {s.lo * 100:.1f}–{s.hi * 100:.1f}%; '
+                   f'{days}{thin})</title></circle>')
+    # levels reported in the news: diamonds
+    for d, p, tip in reported:
+        if start <= d <= end:
+            xx, yy = x(d), y(p)
+            out.append(f'<path d="M{xx:.1f},{yy - 6:.1f}L{xx + 5:.1f},{yy:.1f}L{xx:.1f},{yy + 6:.1f}L{xx - 5:.1f},{yy:.1f}Z" '
+                       f'fill="{NEWS_COLOR}" stroke="#fff" stroke-width="1.5"><title>{esc(tip)}</title></path>')
+    if not have and not reported:
+        out.append(f'<text x="{ML + pw / 2}" y="{MT + ph / 2}" text-anchor="middle" fill="{TEXT}">'
                    'No usable CDS trades in this window</text>')
     out.append("</svg>")
     return "".join(out)
+
+
+def hazard_from_spread(s, T=HORIZON, rec=R):
+    """Constant hazard whose par spread over T years is s (a fraction, e.g. 0.0104 for 104bp)."""
+    return _implied_hazard(0, T, s, rec)
+
+
+def pd_from_spread(s, T=HORIZON, rec=R):
+    """5-year default probability implied by a 5-year CDS spread s, on this file's assumptions."""
+    return 1 - math.exp(-HORIZON * hazard_from_spread(s, T, rec))

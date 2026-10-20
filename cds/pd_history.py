@@ -26,7 +26,7 @@ series = []
 for wk in sorted(weeks):
     v = weeks[wk]
     boots = sorted(st.median(random.choices(v, k=len(v))) for _ in range(2000))
-    assumed = sum(anchored[wk]) < len(v) / 2  # most trades' up-front direction assumed
+    assumed = sum(anchored[wk]) < len(v) / 2  # most trades' up-front direction not settled
     series.append((wk, st.median(v), boots[100], boots[1899], len(v), assumed))
 
 # Each row is a round step (0.5%, 1%, 2% ...) so labels land on exact values; at most ~25 rows.
@@ -72,4 +72,4 @@ for wk, med, lo, hi, n, assumed in series:
     print(f'{wk:%Y-%m}     ' if monthly else f'{wk}  ', end='')
     print(f'{med*100:5.1f}%  {lo*100:5.1f}–{hi*100:5.1f}%   {n:3d}' + ('  *' if assumed else ''))
 if any(x[5] for x in series):
-    print("\n* most trades' up-front direction assumed (buyer pays): no quoted spread since the last possible crossing")
+    print("\n* for most trades the data don't settle who paid the up-front; the buyer-paid reading is shown")

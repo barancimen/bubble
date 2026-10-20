@@ -5,8 +5,8 @@ Fetches raw signals from free public sources and writes dashboard.html next
 to this script. Each signal shows its own "start worrying" line; there is no
 score. The signals follow Ares's Fall 2026 "In the Gaps" newsletter.
 
-Run once a day, e.g. from cron:
-    0 7 * * * SEC_USER_AGENT="Your Name you@example.com" /usr/bin/python3 /root/bubble/bubble_watch.py
+Run once a day, e.g. from cron at 15:00 UTC, after FRED has usually posted the day's spreads (the server's clock is UTC):
+    0 15 * * * SEC_USER_AGENT="Your Name you@example.com" /usr/bin/python3 /root/bubble/bubble_watch.py
 
 The SEC asks every client to identify itself with a name and contact email,
 so set SEC_USER_AGENT. Headlines are classified by DeepSeek V4.1 Flash; the
@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import statistics as st
 import sys
 import time
 import urllib.error
@@ -40,14 +41,17 @@ import cds_signal  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "dashboard.html")
+PREVIEW = os.path.join(HERE, "dashboard-preview.html")  # what a --cached run writes
 SEC_UA = os.environ.get("SEC_USER_AGENT", "bubble-watch admin@example.com")
 WEB_UA = "Mozilla/5.0 (X11; Linux x86_64)"
 
 # Worry lines. Edit these to taste.
 BBB_WIDENING_BP = 30      # BBB spread this far above its 1-year low
 HY_WIDENING_BP = 100      # High-yield spread this far above its 1-year low
-BACKLOG_DROP_PCT = 5      # Backlog (RPO) falls this much in one quarter
 GPU_DROP_13W_PCT = 10     # GPU on-demand median falls this much over 13 weeks
+GPU_START = date(2026, 2, 2)  # the price series became automated here; earlier weeks are hand-entered
+GPU_AVG_WEEKS = 4         # changes compare averages over this many weeks
+SEC_STALE_DAYS = 140      # a newest filed quarter older than this gets a warning
 
 HYPERSCALERS = [  # ticker, SEC CIK, XBRL concept the company uses for capex
     ("MSFT", 789019, "PaymentsToAcquirePropertyPlantAndEquipment"),
@@ -58,7 +62,17 @@ HYPERSCALERS = [  # ticker, SEC CIK, XBRL concept the company uses for capex
 ]
 BACKLOG = [("ORCL", 1341439), ("MSFT", 789019), ("GOOGL", 1652044)]
 NVDA_CIK = 1045810
+COMMITMENTS = [  # ticker, CIK, concept, what the company's filings say the tagged figure is
+    ("GOOGL", 1652044, "LongTermPurchaseCommitmentAmount", "Purchase commitments, mostly long-term supply agreements"),
+    ("META", 1326801, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
+     "Data-center and network leases signed but not yet started"),
+    ("ORCL", 1341439, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
+     "Purchase obligations for cloud components and power"),
+    ("NVDA", 1045810, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
+     "Data-center leases signed but not yet started (tagged once a year)"),
+]
 WEAK_BORROWERS = ["CRWV", "IREN", "HUT", "CIFR", "WULF", "APLD", "ORCL"]
+WEAK_BASKET_PCT, WEAK_EACH_PCT, QQQ_CALM_PCT = 20, 15, 5  # see block_weak_borrowers
 CDS_NAMES = [("CRWV", "CoreWeave"), ("ORCL", "Oracle"), ("NVDA", "Nvidia")]
 GPU_MODELS = [("nvidia-h100", "H100"), ("nvidia-h200", "H200"), ("nvidia-b200", "B200")]
 
@@ -80,6 +94,64 @@ STORE_DAYS = 90           # forget headlines not seen for this long
 CACHED = "--cached" in sys.argv[1:]
 HTTP_CACHE = os.path.join(HERE, "data", "http_cache")
 FETCHED_AT = os.path.join(HTTP_CACHE, "fetched_at")
+
+
+def _run_clock():
+    """(today, now in UTC) for this run: the real clock, or in a --cached run the moment the saved
+    responses were fetched, so that dated searches and date windows match the data."""
+    if CACHED:
+        try:
+            with open(FETCHED_AT) as f:
+                t = datetime.strptime(f.read().strip()[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            return t.date(), t
+        except (OSError, ValueError):
+            pass
+    now = datetime.now(timezone.utc)
+    return now.date(), now
+
+
+TODAY, NOW = _run_clock()
+WARNINGS = []  # problems worth a reader's attention, shown at the top of the page and logged
+
+
+def warn(text):
+    WARNINGS.append(text)
+    print(f"WARNING: {text}", file=sys.stderr)
+
+
+def short_error(e):
+    """An exception as one short line for the public page; the full text goes to the log."""
+    text = re.sub(r"\b(sk|key|token|bearer)[-_ ][A-Za-z0-9_-]{8,}", "[redacted]", " ".join(str(e).split()), flags=re.I)
+    return text[:160] + ("…" if len(text) > 160 else "")
+
+
+def load_json_store(path):
+    """A dict saved by an earlier run, or {} if there is none. A file that can't be read is set
+    aside (renamed .corrupt-<time>) rather than silently replaced, and the run says so."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("not a JSON object")
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        if not CACHED:
+            os.replace(path, f"{path}.corrupt-{NOW:%Y%m%d%H%M}")
+        warn(f"{os.path.basename(path)} couldn't be read ({short_error(e)}); it was set aside and is being rebuilt")
+        return {}
+
+
+def save_json_store(path, data):
+    """Writes a store atomically. A --cached run never writes: it only rebuilds the page."""
+    if CACHED:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
 
 
 def _cache_path(url):
@@ -168,7 +240,7 @@ def fred_series(series_id):
     rows = []
     for r in csv.reader(text.splitlines()[1:]):
         if len(r) == 2 and r[1] not in ("", "."):
-            rows.append((r[0], float(r[1]) * 100))  # percent -> basis points
+            rows.append((r[0], round(float(r[1]) * 100, 6)))  # percent -> basis points, without float dust
     return rows
 
 
@@ -176,15 +248,19 @@ def yahoo_closes(ticker, span="1y"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={span}&interval=1d"
     r = fetch_json(url)["chart"]["result"][0]
     closes = r["indicators"]["quote"][0]["close"]
-    return [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), c)
-            for t, c in zip(r["timestamp"], closes) if c is not None]
+    out = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), c)
+           for t, c in zip(r["timestamp"], closes) if c is not None]
+    # While the market is open, Yahoo's last bar is today's running price, not a close.
+    if out and out[-1][0] == TODAY.isoformat() and NOW.hour < 21:
+        out = out[:-1]
+    return out
 
 
 def gpu_weekly(slug):
     """Weekly on-demand median $/GPU-hour (each provider counted once) as
     [(week start, price, providers)], oldest first, complete weeks only."""
     text = fetch(f"https://getdeploying.com/dataset/gpu-prices/{slug}.csv").decode()
-    today = date.today()
+    today = TODAY
     weeks = []
     for r in csv.DictReader(text.splitlines()):
         if r["billing_type"] == "ON_DEMAND" and r["provider_median_price"]:
@@ -228,8 +304,8 @@ def deepseek(path, payload=None):
         with urllib.request.urlopen(req, timeout=DEEPSEEK_TIMEOUT) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
-        body = e.read()[:200].decode(errors="replace")
-        raise RuntimeError(f"DeepSeek API error {e.code}: {body}") from None
+        print(f"DeepSeek API error {e.code}: {e.read()[:500].decode(errors='replace')}", file=sys.stderr)
+        raise RuntimeError(f"DeepSeek API error {e.code} (details in the run log)") from None
 
 
 # ---------- rendering helpers ----------
@@ -320,12 +396,13 @@ def short_date(d):
     return f"{d:%b} ’{d:%y}"
 
 
-def column_chart(cats, series, fmt, domain=None, w=300, h=200, label_last=True, aria=""):
+def column_chart(cats, series, fmt, domain=None, w=300, h=200, label_last=True, tip=None, aria=""):
     """Grouped columns per category on one shared axis, a vertical gridline between quarters and a
     date under each. series: [(name, color, [value per cat])]. domain=(lo, hi) shares a scale across
     small multiples. Only the last value of a single series is labeled; the rest are on hover."""
     vals = [v for _, _, vs in series for v in vs]
-    lo, hi = domain or (min(0, *vals), max(0, *vals))
+    lo, hi = domain or (min(vals), max(vals))
+    lo, hi = min(0, lo), max(0, hi)  # bars grow from zero, so zero is always on the scale
     ticks = nice_ticks(lo, hi, n=8)
     lo, hi = min(lo, ticks[0]), max(hi, ticks[-1])
     ml, mr, mt, mb = 34, 6, 16, 32
@@ -336,7 +413,7 @@ def column_chart(cats, series, fmt, domain=None, w=300, h=200, label_last=True, 
     out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(aria)}" style="{CHART_FONT}">']
     for t in ticks:
         out.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="{GRID}"/>')
-        out.append(f'<text x="{ml - 5}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=True)}</text>')
+        out.append(f'<text x="{ml - 5}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=float(t).is_integer())}</text>')
     for i in range(len(cats) + 1):  # quarter boundaries
         gx = ml + band * i
         out.append(f'<line x1="{gx:.1f}" x2="{gx:.1f}" y1="{mt}" y2="{mt + ph}" stroke="{GRID}"/>')
@@ -350,7 +427,7 @@ def column_chart(cats, series, fmt, domain=None, w=300, h=200, label_last=True, 
         for k, (name, color, vs) in enumerate(series):
             v = vs[i]
             x = x0 + k * (bw + 2)
-            out.append(f'<path d="{bar_path(x, bw, y(0), y(v))}" fill="{color}"><title>{esc(name)}, quarter ending {esc(cat)}: {fmt(v)}</title></path>')
+            out.append(f'<path d="{bar_path(x, bw, y(0), y(v))}" fill="{color}"><title>{esc(name)}, quarter ending {esc(cat)}: {(tip or fmt)(v)}</title></path>')
             if label_last and i == len(cats) - 1 and len(series) == 1:
                 ty = y(v) - 4 if v >= 0 else y(v) + 12
                 out.append(f'<text x="{x + bw / 2:.1f}" y="{ty:.1f}" text-anchor="middle" fill="{INK}">{fmt(v)}</text>')
@@ -374,7 +451,7 @@ def line_chart(series, fmt, w=960, h=240, label_every=1, aria=""):
     out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(aria)}" style="{CHART_FONT}">']
     for t in ticks:
         out.append(f'<line x1="{ml}" x2="{w - mr}" y1="{y(t):.1f}" y2="{y(t):.1f}" stroke="{GRID}"/>')
-        out.append(f'<text x="{ml - 6}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=True)}</text>')
+        out.append(f'<text x="{ml - 6}" y="{y(t) + 4:.1f}" text-anchor="end" fill="{MUTED}">{fmt(t, tick=float(t).is_integer())}</text>')
     m, k = (days[0].replace(day=28) + timedelta(days=4)).replace(day=1), 0  # first month start inside
     while m <= days[-1]:
         out.append(f'<line x1="{x(m):.1f}" x2="{x(m):.1f}" y1="{mt}" y2="{mt + ph}" stroke="{GRID}"/>')
@@ -404,46 +481,144 @@ def money_b(v, tick=False):
     return f"−{abs(v):,.1f}" if v < 0 else f"{v:,.1f}"
 
 
+def money_tip(v):
+    """A value in $B for a tooltip, e.g. "−$5.9B"."""
+    return f"−${abs(v):,.1f}B" if v < 0 else f"${v:,.1f}B"
+
+
 # ---------- signal blocks ----------
 
+def sec_concept_or_empty(cik, concept):
+    """Like sec_concept, but [] when the company doesn't report that concept at all."""
+    try:
+        return sec_concept(cik, concept)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return []
+        raise
+    except RuntimeError:  # a --cached run that never fetched it
+        return []
+
+
+def stale(end, what, max_days=SEC_STALE_DAYS):
+    """Warns (and returns a note) when the newest filed figure is older than max_days."""
+    age = (TODAY - date.fromisoformat(end)).days
+    if age > max_days:
+        warn(f"{what}: the newest filed figures are for {end}, {age} days ago")
+        return f" The newest figures are for {end}, which is unusually old: check for a late filing or a renamed concept."
+    return ""
+
+
+ORACLE_STORE = os.path.join(HERE, "data", "oracle_prepayments.json")
+ORACLE_PREPAID = "IncreaseDecreaseInDeferredRevenuesFromCustomerPrepaymentsWithSignificantFinancingComponent"
+
+
+def oracle_prepayments():
+    """{quarter end: customer prepayments with a significant financing component} that Oracle counts
+    in operating cash flow. The line is in Oracle's own XBRL extension, which the SEC's API leaves
+    out, so it is read from each filing's XBRL instance once and remembered. Quarters before the line
+    first appeared count as zero."""
+    store = load_json_store(ORACLE_STORE)
+    sub = fetch_json("https://data.sec.gov/submissions/CIK0001341439.json", SEC_UA)["filings"]["recent"]
+    for i, form in enumerate(sub["form"]):
+        acc, period = sub["accessionNumber"][i], sub["reportDate"][i]
+        if form not in ("10-Q", "10-K") or period < "2025-05-01" or acc in store:
+            continue
+        base = f"https://www.sec.gov/Archives/edgar/data/1341439/{acc.replace('-', '')}/"
+        time.sleep(0.2)
+        names = [x["name"] for x in fetch_json(base + "index.json", SEC_UA)["directory"]["item"]]
+        inst = next((n for n in names if n.endswith("_htm.xml")), None)
+        facts = []
+        if inst:
+            time.sleep(0.2)
+            root = ET.fromstring(fetch(base + inst, SEC_UA))
+            ctx = {}
+            for c in root.iter():
+                if c.tag.endswith("}context") and not any(x.tag.endswith("}segment") for x in c.iter()):
+                    sd, ed = c.find(".//{*}startDate"), c.find(".//{*}endDate")
+                    if sd is not None and ed is not None:
+                        ctx[c.get("id")] = (sd.text, ed.text)
+            facts = sorted({(*ctx[e.get("contextRef")], float(e.text)) for e in root.iter()
+                            if e.tag.endswith("}" + ORACLE_PREPAID) and e.get("contextRef") in ctx and e.text})
+        store[acc] = dict(period=period, form=form, facts=facts)
+    save_json_store(ORACLE_STORE, store)
+    ytd = {(s0, e): v for rec in store.values() for s0, e, v in rec["facts"]}
+    out = {}
+    for (s0, e), v in ytd.items():
+        if days_between(s0, e) <= 100:
+            out[e] = v
+            continue
+        prev = [v2 for (s2, e2), v2 in ytd.items() if s2 == s0 and 80 <= days_between(e2, e) <= 100]
+        out[e] = v - (prev[0] if prev else 0)  # no earlier figure this fiscal year: the line was zero
+    return out
+
+
 def block_hyperscalers():
-    rows, fcf_negative, capex_down, panels = [], [], [], []
+    rows, panels, fcf_negative, capex_down, unknown, notes = [], [], [], [], [], ""
     for ticker, cik, capex_concept in HYPERSCALERS:
         ocf = quarterly_flows(sec_concept(cik, "NetCashProvidedByUsedInOperatingActivities"))
         capex = quarterly_flows(sec_concept(cik, capex_concept))
-        ends = [e for e in capex if e in ocf][-6:]
+        lease = quarterly_flows(sec_concept_or_empty(cik, "FinanceLeasePrincipalPayments"))
+        prepaid = oracle_prepayments() if ticker == "ORCL" else {}
+        ends = [e for e in capex if e in ocf]
+        fcf = {e: ocf[e] - capex[e] - lease.get(e, 0) - prepaid.get(e, 0) for e in ends}
         last = ends[-1]
-        fcf = [ocf[e] - capex[e] for e in ends]
-        prior = year_earlier(capex, last)
-        yoy = (capex[last] / prior - 1) * 100 if prior else None
-        if fcf[-1] < 0:
-            fcf_negative.append(ticker)
-        if yoy is not None and yoy < 0:
+        notes += stale(last, f"{ticker} capex and cash flow")
+        ttm = sum(fcf[e] for e in ends[-4:]) if len(ends) >= 4 else None
+        yoys = []
+        for e in ends[-2:]:
+            prior = year_earlier(capex, e)
+            yoys.append((capex[e] / prior - 1) * 100 if prior else None)
+        if None in yoys:
+            unknown.append(ticker)
+        elif all(y < 0 for y in yoys):
             capex_down.append(ticker)
-        panels.append((ticker, ends, [capex[e] / 1e9 for e in ends], [v / 1e9 for v in fcf]))
-        rows.append([ticker, esc(last), pct(yoy, True)])
-    domain = (min(min(f) for *_, f in panels), max(max(c) for _, _, c, _ in panels))
+        if ttm is not None and ttm < 0:
+            fcf_negative.append(ticker)
+        last6 = ends[-6:]
+        panels.append((ticker, last6, [capex[e] / 1e9 for e in last6], [fcf[e] / 1e9 for e in last6]))
+        if prepaid:
+            notes += (f" For Oracle, customer prepayments with a significant financing component "
+                      f"(${sum(prepaid.get(e, 0) for e in ends[-4:]) / 1e9:,.1f}B over the last four quarters) are "
+                      "taken out of operating cash flow: Oracle counts them there, but they are customers "
+                      "funding Oracle's build-out, not cash its business generated.")
+        rows.append([ticker, esc(last), billions(ttm, True) if ttm is not None else "n/a",
+                     " / ".join(pct(y, True) for y in yoys)])
+    lo = min(0, *(min(f) for *_, f in panels))
+    hi = max(0, *(max(c) for _, _, c, _ in panels))
     out = legend([("Capex", SERIES[0]), ("Free cash flow", SERIES[1])])
     out += ('<p class="muted">Last 6 quarters by quarter-end month, $B, same scale for every '
             'company. Hover a bar for its exact value.</p><div class="multiples">')
     out += "".join(
         f"<div><h5>{t}</h5>" + column_chart(ends, [("Capex", SERIES[0], c), ("Free cash flow", SERIES[1], f)],
-                                           money_b, domain,
+                                           money_b, (lo, hi), tip=money_tip,
                                            aria=f"{t} capex and free cash flow, last 6 quarters") + "</div>"
         for t, ends, c, f in panels) + "</div>"
-    out += table(["Company", "Latest quarter end", "Latest capex vs same quarter a year earlier"], rows)
+    out += table(["Company", "Latest quarter end", "Free cash flow, last 4 quarters ($B)",
+                  "Capex vs same quarter a year earlier (previous / latest quarter)"], rows)
+    detail = f"Two quarters below a year earlier: {', '.join(capex_down)}." if capex_down else ""
+    if unknown:
+        detail += f" No year-earlier figure for {', '.join(unknown)}, so check by hand."
     out += line(
-        "any company's quarterly capex is lower than in the same quarter a year earlier. "
-        "This is the pull-back Ares names as the trigger. A capex-guidance cut on an earnings "
-        "call comes before it shows up here, so read the calls (late Jan, Apr, Jul, Oct).",
-        bool(capex_down), f"Lower than a year earlier: {', '.join(capex_down)}." if capex_down else "")
+        "any company's quarterly capex is lower than in the same quarter a year earlier, two "
+        "quarters in a row (one lumpy quarter isn't enough). Ares's trigger is a season of "
+        "disappointing AI revenue that leads boards to shift spending; a cut to capex guidance "
+        "on an earnings call comes months before it shows up here, so read the calls: Microsoft, "
+        "Alphabet, Amazon and Meta report in late January or early February, late April, late July "
+        "and late October; Oracle in mid-March, mid-June, mid-September and mid-December.",
+        True if capex_down else (None if unknown else False), detail)
     out += line(
-        "free cash flow is below zero, meaning capex is bigger than the cash the business "
-        "generates and the gap is borrowed. Ares flagged this as already happening.",
-        bool(fcf_negative),
-        f"Negative in the latest quarter: {', '.join(fcf_negative)}." if fcf_negative else "")
-    out += ('<p class="muted">Free cash flow here = operating cash flow − purchases of property '
-            "and equipment, as filed. Companies' own definitions differ (e.g. finance leases).</p>")
+        "free cash flow over the last four quarters is below zero: over a full year, capex and "
+        "lease repayments took more than the cash the business generated. Single quarters swing "
+        "with working capital and the seasons (Amazon's first quarter is often negative), so they "
+        "don't count on their own. Ares pointed to Alphabet and Amazon posting negative free cash "
+        "flow in a recent quarter.",
+        bool(fcf_negative), f"Negative over the last four quarters: {', '.join(fcf_negative)}." if fcf_negative else "")
+    out += ('<p class="muted">Free cash flow here = operating cash flow − purchases of property and '
+            "equipment − principal repayments of finance leases (where reported), as filed; this is "
+            "Meta's own definition. Amazon's headline figure nets proceeds from asset sales against "
+            "capex, and Microsoft's headline capex includes assets taken on through finance leases, so "
+            f"their own figures differ.{notes}</p>")
     return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
 
 
@@ -454,82 +629,128 @@ def block_nvidia():
     out = ('<p class="muted">Quarterly revenue by quarter-end month, $B. Hover a bar for its '
            'exact value.</p><div style="max-width:480px">'
            + column_chart(ends, [("Revenue", SERIES[0], [rev[e] / 1e9 for e in ends])], money_b,
-                          w=480, h=220, aria="Nvidia quarterly revenue, last 6 quarters") + "</div>")
+                          w=480, h=220, tip=money_tip, aria="Nvidia quarterly revenue, last 6 quarters") + "</div>")
     out += line("revenue falls from the previous quarter. Nvidia's sales are AI spending arriving; "
-                "a sequential drop means buyers are slowing down.",
-                change < 0, f"Latest quarter vs previous: {pct(change, True)}.")
+                "a sequential drop means buyers are slowing down. Nvidia also guides the next "
+                "quarter's revenue in its results (late February, May, August and November); a guide "
+                "below the latest quarter is an earlier warning than this line.",
+                change < 0, f"Latest quarter vs previous: {pct(change, True)}." + stale(ends[-1], "Nvidia revenue"))
     return out + source("SEC EDGAR XBRL filings (Nvidia)",
                         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
 
 
 def block_backlog():
-    rows, dropped, panels = [], [], []
+    rows, crossed, panels, dips, notes = [], [], [], [], ""
     for ticker, cik in BACKLOG:
         rpo = point_in_time(sec_concept(cik, "RevenueRemainingPerformanceObligation"))
-        ends = list(rpo)[-6:]
-        change = (rpo[ends[-1]] / rpo[ends[-2]] - 1) * 100
-        if change <= -BACKLOG_DROP_PCT:
-            dropped.append(ticker)
-        panels.append((ticker, ends, [rpo[e] / 1e9 for e in ends]))
-        rows.append([ticker, esc(ends[-1]), pct(change, True)])
+        ends = list(rpo)
+        q = [(rpo[e] / rpo[p] - 1) * 100 for p, e in zip(ends, ends[1:])]
+        prior = year_earlier(rpo, ends[-1])
+        yoy = (rpo[ends[-1]] / prior - 1) * 100 if prior else None
+        if (yoy is not None and yoy < 0) or (len(q) >= 2 and q[-1] < 0 and q[-2] < 0):
+            crossed.append(ticker)
+        worst = min(zip(q, ends[1:]), default=None)
+        if worst and worst[0] < 0:
+            dips.append(f"{ticker} {worst[0]:.1f}% ({date.fromisoformat(worst[1]):%b %Y})")
+        notes += stale(ends[-1], f"{ticker} backlog")
+        last6 = ends[-6:]
+        panels.append((ticker, last6, [rpo[e] / 1e9 for e in last6]))
+        rows.append([ticker, esc(ends[-1]), pct(q[-1], True) if q else "n/a", pct(yoy, True)])
     domain = (0, max(max(v) for *_, v in panels))
     out = ('<p class="muted">Contract backlog, last 6 quarters by quarter-end month, $B, same scale '
            'for every company. Hover a bar for its exact value.</p><div class="multiples">')
     out += "".join(f"<div><h5>{t}</h5>" + column_chart(ends, [("Backlog", SERIES[0], v)], money_b, domain,
-                                                      aria=f"{t} contract backlog, last 6 quarters")
+                                                      tip=money_tip, aria=f"{t} contract backlog, last 6 quarters")
                    + "</div>" for t, ends, v in panels) + "</div>"
-    out += table(["Company", "Latest quarter end", "Latest vs previous quarter"], rows)
+    out += table(["Company", "Latest quarter end", "vs previous quarter", "vs a year earlier"], rows)
     out += line(
-        f"backlog falls more than {BACKLOG_DROP_PCT}% in a quarter at any of the three. "
-        "Much of this backlog is OpenAI and Anthropic compute commitments (e.g. OpenAI's $300B "
-        "with Oracle), so a drop means commitments are being cut or renegotiated. Normal dips "
-        "over the last three years were under 4%.",
-        bool(dropped), f"Dropped: {', '.join(dropped)}." if dropped else "")
+        "backlog at any of the three is lower than a year earlier, or has fallen two quarters in "
+        "a row. Much of it is reported to be OpenAI and Anthropic compute commitments (e.g. OpenAI's "
+        "reported $300B deal with Oracle), so a sustained fall can mean commitments are being cut "
+        "or renegotiated. A single quarterly dip isn't enough: backlog is worked off as it is "
+        "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
+        "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
+        bool(crossed), (f"Crossed: {', '.join(crossed)}." if crossed else "") + notes)
     return out + source("SEC EDGAR XBRL filings (remaining performance obligations)",
                         "https://www.sec.gov/edgar/search/")
 
 
+def block_commitments():
+    rows = []
+    for ticker, cik, concept, what in COMMITMENTS:
+        series = point_in_time(sec_concept_or_empty(cik, concept))
+        if not series:
+            rows.append([ticker, esc(what), "not reported", "n/a", "n/a"])
+            continue
+        last = list(series)[-1]
+        earlier = [(e, v) for e, v in series.items() if 300 <= days_between(e, last) <= 460]
+        prev = earlier[-1] if earlier else None
+        note = stale(last, f"{ticker} commitments", 400)  # some are tagged only once a year
+        rows.append([ticker, esc(what), f"${series[last] / 1e9:,.1f}B ({esc(last)})",
+                     f"${prev[1] / 1e9:,.1f}B ({esc(prev[0])})" if prev else "n/a",
+                     (f"×{series[last] / prev[1]:.1f}" if prev and prev[1] > 0 else "n/a") + (" *" if note else "")])
+    out = table(["Company", "What the filing says it is", "Latest", "About a year earlier", "Change"], rows)
+    out += no_line(
+        "These are payments the companies have signed up for that are not on their balance sheets as "
+        "debt: leases for data centers that haven't started yet, and long-term purchase and supply "
+        "agreements. Ares counts about $3 trillion of such lease and purchase commitments across the "
+        "eight largest AI companies. Each company tags a different thing, so compare a company with "
+        "its own past, not with the others. Microsoft and Amazon don't tag a comparable figure; "
+        "Alphabet's and Oracle's leases not yet started, and Nvidia's much larger supply and capacity "
+        "commitments, appear only in the text of their filings. "
+        "Worry when these keep growing much faster than the companies' cash flow.")
+    return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
+
+
 def block_gpu_prices():
-    rows, crossed, lines = [], [], []
+    rows, crossed, lines, worst_text = [], [], [], []
     for i, (slug, name) in enumerate(GPU_MODELS):
-        weeks = gpu_weekly(slug)
+        weeks = [w for w in gpu_weekly(slug) if w[0] >= GPU_START.isoformat()]
         lines.append((name, SERIES[i], [(w, p) for w, p, _ in weeks]))
         week, price, providers = weeks[-1]
+        avg = lambda j: st.mean(p for _, p, _ in weeks[j - GPU_AVG_WEEKS + 1:j + 1])  # 4-week average ending at week j
 
-        def change(n, i=len(weeks) - 1):
-            return (weeks[i][1] / weeks[i - n][1] - 1) * 100 if i >= n else None
+        def change(n, j=len(weeks) - 1):
+            return (avg(j) / avg(j - n) - 1) * 100 if j - n >= GPU_AVG_WEEKS - 1 else None
 
         c13 = change(13)
         if c13 is not None and c13 <= -GPU_DROP_13W_PCT:
             crossed.append(name)
-        worst = min((change(13, i) for i in range(13, len(weeks))), default=None)
+        worst = min((change(13, j) for j in range(13 + GPU_AVG_WEEKS - 1, len(weeks))), default=None)
+        if worst is not None:
+            worst_text.append(f"{name} {worst:+.1f}%")
+        mix = " (provider count changed by more than a fifth this week)" if abs(providers - weeks[-2][2]) > 0.2 * weeks[-2][2] else ""
         rows.append([
-            name, f"${price:.2f}", f"{esc(week)} ({providers} providers)",
+            name, f"${price:.2f}", f"{esc(week)}, {providers} providers{mix}",
             pct(change(4)),
             f'<span class="bad">{pct(c13)}</span>' if name in crossed else pct(c13),
-            pct(worst), pct(change(len(weeks) - 1)) + f" (since {esc(weeks[0][0])})",
+            pct(worst), pct((avg(len(weeks) - 1) / avg(GPU_AVG_WEEKS - 1) - 1) * 100) + f" (since {esc(weeks[0][0])})",
         ])
     out = legend([(n, c) for n, c, _ in lines])
-    out += ('<p class="muted">Weekly median on-demand price, $/GPU-hour; vertical lines mark the '
-            'start of each month. Hover a line for the week and price.</p>')
+    out += ('<p class="muted">Weekly median advertised on-demand price, $/GPU-hour (sold-out listings '
+            'excluded; a median also moves when providers come and go); vertical lines mark the start '
+            'of each month. Hover a line for the week and price.</p>')
     fmt = lambda v, tick=False: f"${v:.0f}" if tick else f"${v:.2f}"
     out += (f'<div class="wide">{line_chart(lines, fmt, aria="Weekly median GPU rental prices")}</div>'
             f'<div class="narrow">{line_chart(lines, fmt, w=380, h=260, label_every=3, aria="Weekly median GPU rental prices")}</div>')
     out += table(["GPU", "Latest weekly median, $/GPU-hour", "Latest week", "4 weeks", "13 weeks",
-                 "Worst 13-week change in the data", "Whole series"], rows)
+                  "Worst 13-week change", "Whole series"], rows)
     out += line(
-        f"the on-demand median falls {GPU_DROP_13W_PCT}% or more over 13 weeks (about 90 days). "
-        "Over the past year these prices rose and their worst 13-week dips were small (see the "
-        "table), so a drop this size would break the trend. Falling rental prices mean the chips "
-        "backing GPU loans are losing value faster than lenders assumed. (Ares's chart covers "
-        "2023–25, when H100 rentals fell from about $8.50 to $3.00 as the chip shortage eased.)",
+        f"the {GPU_AVG_WEEKS}-week average of the on-demand median falls {GPU_DROP_13W_PCT}% or more over "
+        "13 weeks (about 90 days). Changes compare 4-week averages, because single weeks jump when "
+        "listings sell out or providers come and go. Since the source switched to automated price "
+        f"collection ({GPU_START:%b %-d, %Y}), the worst 13-week changes were: {', '.join(worst_text)}. "
+        "Falling rental prices mean the chips backing GPU loans are losing value faster than lenders "
+        "assumed. (Ares's chart covers 2023–25, when H100 rentals fell from about $8.50 to $3.00; Ares "
+        "ties the risk to new chip generations, which Nvidia now ships roughly every year.)",
         bool(crossed), f"Crossed: {', '.join(crossed)}." if crossed else "")
     return out + (
         '<p class="muted">Source: <a href="https://getdeploying.com/dataset/gpu-prices">'
         "GetDeploying, GPU rental price history</a>, "
         '<a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. Weekly median '
-        "on-demand price across cloud providers, each provider counted once; the current week "
-        "is left out until it is complete.</p>")
+        "advertised on-demand price across cloud providers, each provider counted once; the current "
+        "week is left out until it is complete. Changes use 4-week averages from "
+        f"{GPU_START:%b %-d, %Y}, when the series switched from hand-entered to automated prices.</p>")
 
 
 def spread_episodes(rows, limit):
@@ -570,6 +791,8 @@ def block_spreads():
         rows = fred_series(series_id)
         history.append(describe_episodes(short, limit, *spread_episodes(rows, limit)))
         d, latest = rows[-1]
+        if (TODAY - date.fromisoformat(d)).days > 6:
+            warn(f"{name} spread: the newest FRED value is for {d}")
         year_ago = (date.fromisoformat(d) - timedelta(days=365)).isoformat()
         low_d, low = min(((x, v) for x, v in rows if x >= year_ago), key=lambda p: p[1])
         month_ago = [v for x, v in rows
@@ -593,84 +816,245 @@ def block_spreads():
                         "https://fred.stlouisfed.org/series/BAMLC0A4CBBB")
 
 
+# ---------- CDS levels reported in the news ----------
+# The DTCC-based estimate is checked against 5-year CDS levels reported in the press: a curated
+# list (cds/published_levels.csv) plus levels stated in news headlines from now on. DeepSeek reads
+# each candidate headline once; a level is used only if its number and unit appear in the
+# headline word for word.
+
+CDS_NEWS_STORE = os.path.join(HERE, "data", "cds_news.json")
+CDS_NEWS_DAYS = 30
+CDS_WORDS = re.compile(r"credit[- ]default[- ]swaps?|\bCDS\b", re.I)
+CDS_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:bp\b|bps\b|basis points?|percentage points?)", re.I)
+CDS_NEWS_INSTRUCTIONS = """\
+You read news headlines about credit default swaps (CDS). For each numbered headline, say whether it \
+states the LEVEL of the named company's 5-year CDS spread: the spread itself, not a change in it, \
+and not a bond spread, a bond yield, an index or another company.
+
+Answer with one line per headline:
+ID | LEVEL | <the number exactly as written in the headline> | <its unit exactly as written>
+or
+ID | NONE
+
+A change ("up 40bp", "widens by 40 basis points") is NONE, and so is a bound ("tops 1,000bp", \
+"above 300 basis points", "nearly 900bp"). If the headline gives several levels, use the latest one. \
+If it doesn't say which maturity, assume 5 years; any other stated maturity is NONE."""
+
+
+BOUND_WORDS = re.compile(r"(above|over|exceed(s|ed|ing)?|tops?|topped|surpass(es|ed)?|beyond|more than|at least|"
+                         r"nearly|almost|near|under|below|past|crosse?s?d?)\s+$", re.I)
+
+
+def is_bound(title, number):
+    """True when the number is a threshold ("tops 1,000bp") rather than a level."""
+    i = title.find(number)
+    return i < 0 or bool(BOUND_WORDS.search(title[:i]))
+
+
+def cds_news_levels():
+    """{ticker: [dict(date, bp, source, url, title)]} from the headline store, after reading any new
+    candidate headlines."""
+    store = load_json_store(CDS_NEWS_STORE)
+    candidates = []
+    for ticker, name in ([] if CACHED else CDS_NAMES):  # a --cached run only reuses what's stored
+        query = f'"{name}" ("credit default swap" OR "credit default swaps" OR CDS) when:{CDS_NEWS_DAYS}d'
+        for h in (x for part in search(query) for x in part):
+            title, key = h["title"], headline_key(h["title"])
+            if (key in store or name.lower() not in title.lower() or not CDS_WORDS.search(title)
+                    or not CDS_NUMBER.search(title)):
+                continue
+            candidates.append((ticker, name, h, key))
+    if candidates and not CACHED:
+        check_model("reading CDS levels in headlines")
+        r = deepseek("/chat/completions", {
+            "model": DEEPSEEK_MODEL, "reasoning_effort": "high", "max_tokens": 16000,
+            "messages": [{"role": "system", "content": CDS_NEWS_INSTRUCTIONS},
+                         {"role": "user", "content": "\n".join(f"{i}. [{name}] {h['title']}"
+                                                               for i, (_, name, h, _) in enumerate(candidates))}]})
+        choice = r["choices"][0]
+        if choice.get("finish_reason") != "stop":
+            raise RuntimeError(f"the model stopped early ({choice.get('finish_reason')})")
+        answers = {}
+        for row in (choice["message"].get("content") or "").splitlines():
+            m = re.match(r"\s*(\d+)\s*\|\s*(LEVEL|NONE)\s*(?:\|\s*([\d,.]+)\s*\|\s*(.+?))?\s*$", row)
+            if m:
+                answers[int(m.group(1))] = m.groups()[1:]
+        for i, (ticker, name, h, key) in enumerate(candidates):
+            if i not in answers:
+                continue  # left out: try again next run
+            kind, number, unit = answers[i]
+            bp = None
+            if (kind == "LEVEL" and number and unit and f"{number}" in h["title"] and unit.lower() in h["title"].lower()
+                    and not is_bound(h["title"], number)):
+                value = float(number.replace(",", ""))
+                bp = value * 100 if unit.lower().startswith("percentage") else value
+                if not 1 <= bp <= 10000:
+                    bp = None
+            store[key] = dict(ticker=ticker, date=h["when"].date().isoformat(), title=h["title"],
+                              url=h["link"], bp=bp, model=DEEPSEEK_MODEL_NAME)
+        save_json_store(CDS_NEWS_STORE, store)
+    out = {t: [] for t, _ in CDS_NAMES}
+    for v in store.values():
+        if v.get("bp") and v["ticker"] in out and not is_bound(v["title"], f"{v['bp']:,.0f}"):
+            title = v["title"]
+            source = title.rsplit(" - ", 1)[1] if " - " in title else "news"
+            out[v["ticker"]].append(dict(date=date.fromisoformat(v["date"]), bp=v["bp"], source=source,
+                                         url=v["url"], title=title))
+    return out
+
+
+def reported_levels():
+    """{ticker: [dict(date, bp, source, url, note, out_of_sample)]}: the curated published levels
+    plus those read from headlines (a headline within a day and 3% of a curated level is the same
+    report). Levels found after the method was fixed count as out of sample."""
+    out = {}
+    curated = cds_signal.published_levels()
+    try:
+        news_levels, problem = cds_news_levels(), None
+    except Exception as e:
+        news_levels, problem = {}, f"CDS levels in today's headlines weren't read: {short_error(e)}"
+    for ticker, _ in CDS_NAMES:
+        rows = [dict(r, out_of_sample=r["role"] == "holdout") for r in curated.get(ticker, [])]
+        for n in news_levels.get(ticker, []):
+            if not any(abs((n["date"] - r["date"]).days) <= 1 and abs(n["bp"] / r["bp"] - 1) <= 0.03 for r in rows):
+                rows.append(dict(n, note=n["title"], out_of_sample=True))
+        out[ticker] = sorted(rows, key=lambda r: r["date"])
+    return out, problem
+
+
+def pct_text(p):
+    """A default probability with honest precision: whole percents from 10% up."""
+    return f"{p * 100:.0f}%" if p >= 0.095 else f"{p * 100:.1f}%"
+
+
 def block_cds():
-    today = date.today()
+    today = TODAY
     start = today - timedelta(days=cds_signal.WINDOW_DAYS)
     data = cds_signal.series(today, download=not CACHED)
-    out = ('<p class="legend"><span class="key" style="background:#2a78d6;border:2px solid #2a78d6;'
-           'width:6px;height:6px;border-radius:50%"></span>5-year default '
-           'probability, monthly median (left axis, from 0%); bar = 90% interval '
-           '<span class="key" style="background:#fff;border:2px solid #2a78d6;width:6px;height:6px;'
-           'border-radius:50%"></span>hollow = payment direction assumed (see note below) '
-           '<span class="key" style="background:#8f8d87;height:2px"></span>Stock price, daily close '
-           "(right axis, log scale)</p>")
-    rows = []
+    reported, problem = reported_levels()
+    to_pd = cds_signal.pd_from_spread
+    # one probability scale for all three, so they can be compared
+    peak = max([s.hi or s.median for series, *_ in data.values() for s in series if s.median is not None]
+               + [to_pd(r["bp"] / 1e4) for rows in reported.values() for r in rows if start <= r["date"] <= today] + [0.01])
+    top = cds_signal.nice_pd_max(peak)
+    out = ('<p class="legend">'
+           '<span class="key" style="background:#2a78d6;border:2px solid #2a78d6;width:6px;height:6px;border-radius:50%"></span>'
+           'Estimate from CDS trades (DTCC), monthly median; bar = 90% interval; faded = fewer than 3 trading days '
+           '<span class="key" style="background:#2a78d6;opacity:.25;width:8px;height:14px;border-radius:4px"></span>'
+           'month where the trade data can\'t tell who paid the up-front (both readings shown) '
+           '<span class="key" style="background:#eb6834;width:9px;height:9px;transform:rotate(45deg);border-radius:1px"></span>'
+           'level reported in the news '
+           '<span class="key" style="background:#8f8d87;height:2px"></span>'
+           'stock price, daily close (left axis, log scale)</p>'
+           '<p class="muted">Right axis: 5-year default probability, one scale for all three companies. Hover a '
+           'point for details and sources.</p>')
+    rows, gaps = [], []
     for ticker, name in CDS_NAMES:
         try:
             closes = [(date.fromisoformat(d), c) for d, c in yahoo_closes(ticker, "2y")]
             note = ""
         except Exception as e:
-            closes, note = [], f'<p class="error">Stock price unavailable today: {esc(e)}</p>'
-        series, by_rec = data[ticker]
-        out += f"<h4>{esc(name)} ({ticker})</h4>" + cds_signal.svg_chart(ticker, series, closes, start, today) + note
-        idx = [i for i, s in enumerate(series) if s[1] is not None]
-        if not idx:
-            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "0"])
+            closes, note = [], f'<p class="error">Stock price unavailable today: {esc(short_error(e))}</p>'
+        series, by_rec, pts = data[ticker]
+        marks = []
+        for r in reported[ticker]:
+            mine, n = cds_signal.estimate_near(pts, r["date"])
+            check = (f"; trade-based estimate {mine:,.0f}bp from {n} trade{'s' * (n != 1)} in the days before"
+                     if mine else "")
+            if mine and r["out_of_sample"] and start <= r["date"] <= today:
+                gaps.append(abs(mine / r["bp"] - 1))
+            note_text = f" ({r['note']})" if r.get("note") and r["note"] != r.get("title") else ""
+            marks.append((r["date"], to_pd(r["bp"] / 1e4),
+                          f"{r['source']}, {r['date']:%b %-d, %Y}: 5-year CDS {r['bp']:,.0f}bp{note_text} "
+                          f"= {pct_text(to_pd(r['bp'] / 1e4))} on this page's assumptions{check}"))
+        out += (f"<h4>{esc(name)} ({ticker})</h4>"
+                + cds_signal.svg_chart(ticker, series, closes, start, today, top, marks) + note)
+        have = [s for s in series if s.median is not None]
+        latest_news = max(reported[ticker], key=lambda r: r["date"], default=None)
+        news_cell = (f'<a href="{esc(latest_news["url"])}">{latest_news["bp"]:,.0f}bp</a> on '
+                     f'{latest_news["date"]:%b %-d} ({esc(latest_news["source"])}) = {pct_text(to_pd(latest_news["bp"] / 1e4))}'
+                     if latest_news else "none found")
+        if not have:
+            rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "n/a", "n/a", news_cell, "0"])
             continue
-        m, med, lo, hi, n, assumed = series[idx[-1]]
-        rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
-        rec = (f"{rec_lo * 100:.1f}–{rec_hi * 100:.1f}%" if rec_lo is not None and rec_hi is not None
-               else "n/a")
-        rows.append([f"{esc(name)} ({ticker})",
-                     f"{med * 100:.1f}% ({lo * 100:.1f}–{hi * 100:.1f}%), {m:%b %Y}" + " *" * assumed,
-                     rec, str(n)])
+        s = have[-1]
+        period = (f"{s.month:%b} 1–{s.last.day}, {s.month:%Y}" if (s.last.year, s.last.month) == (today.year, today.month)
+                  else f"{s.month:%b %Y}")
+        bp = lambda p: cds_signal.par_spread(-math.log(1 - p) / cds_signal.HORIZON) * 1e4
+        if s.unresolved:
+            est = f"{pct_text(s.alt)} or {pct_text(s.median)} (who paid isn't settled)"
+            spread = f"{bp(s.alt):,.0f} or {bp(s.median):,.0f}bp"
+            rec = "n/a"
+        else:
+            est = f"{pct_text(s.median)} ({pct_text(s.lo)}–{pct_text(s.hi)})"
+            spread = f"{bp(s.median):,.0f}bp"
+            rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
+            rec = f"{pct_text(rec_lo)}–{pct_text(rec_hi)}" if rec_lo is not None and rec_hi is not None else "n/a"
+        rows.append([f"{esc(name)} ({ticker})", period, est, spread, rec, news_cell, f"{s.n} on {s.days} days"])
     rec_lo, rec_hi = (f"{r:.0%}" for r in cds_signal.RECOVERY_RANGE)
-    out += table(["Company", "5-year default probability, latest month (90% interval)",
-                  f"Same month at {rec_lo}–{rec_hi} recovery", "Trades in latest month"], rows)
+    out += table(["Company", "Latest month", "5-year default probability (90% interval)", "≈ 5-year spread",
+                  f"At {rec_lo}–{rec_hi} recovery", "Latest level in the news", "Trades"], rows)
+    accuracy = (f"Against the {len(gaps)} reported levels that were not used to build the method and have trades "
+                f"in the days before them, the trade-based estimate differs by a median of {st.median(gaps) * 100:.0f}% "
+                f"(at most {max(gaps) * 100:.0f}%). " if gaps else "")
     out += no_line(
-        "This is what credit default swap buyers pay for protection against each company's "
-        "bankruptcy or failure to pay on its own debt within 5 years (a restructuring doesn't "
-        "count, nor does a default by a separate financing subsidiary). It is a market price, "
-        "not a forecast: it includes a premium for bearing the risk, so true odds are lower, and "
-        f"it assumes lenders recover {cds_signal.R:.0%} in a default. That assumption matters: "
-        f"the recovery column shows the same month priced at {rec_lo} and {rec_hi} recovery "
-        "(lower recovery means a lower implied default probability for the same price). Worry when it climbs for several months "
-        "in a row, and most when CoreWeave and Oracle climb together while Nvidia stays flat, "
-        "which points to the AI financing chain rather than chip demand.")
+        "This is the 5-year default probability implied by what credit default swap buyers pay for "
+        "protection against the company failing to pay its debts or going bankrupt (including on debt "
+        "it guarantees; a restructuring or an out-of-court debt exchange generally doesn't count, nor "
+        "does a default by a subsidiary whose debt it doesn't guarantee). It is a market price, not a "
+        "forecast: it includes a premium for bearing the risk, so the real-world odds are likely lower, "
+        f"and it assumes lenders recover {cds_signal.R:.0%} in a default (the recovery column shows "
+        f"{rec_lo} and {rec_hi}; lower recovery means a lower probability for the same price). " + accuracy +
+        "Worry when it climbs for several months in a row, and most when CoreWeave and Oracle climb "
+        "together while Nvidia stays flat, which points to the AI financing chain rather than chip demand.")
+    if problem:
+        out += f'<p class="error">{esc(problem)}</p>'
     return out + (
         '<p class="muted">Source: <a href="https://pddata.dtcc.com/ppd/secdashboard">DTCC public '
-        "security-based swap data</a> (SEC Regulation SBSR) and Yahoo Finance daily closes. Uses "
-        "US-dollar standard-coupon trades with 4–6 years left, priced from their quoted spread or, "
-        'failing that, their up-front payment and exact size (trades reported only as "$5,000,000+" '
-        "without a spread are left out). Some spreads are reported 100 times too small; these are "
-        "scaled up only when the result matches properly reported quotes within "
-        f"{cds_signal.RESCALE_DAYS} days, and otherwise left out. DTCC reports an up-front's size but not who paid it: "
-        "the buyer pays when the spread is above the contract's fixed coupon, the seller when "
-        "it is below. A nearby quoted spread settles the direction; where none exists since the "
-        "spread last came near the coupon, the buyer is assumed to pay (hollow dots, * in the "
-        "table). Months with no trades are left blank. Each chart has its own "
-        "default-probability scale.</p>")
+        "security-based swap data</a> (SEC Regulation SBSR), reported levels from the press as linked, and "
+        "Yahoo Finance daily closes. The estimate uses US-dollar standard-coupon trades on each company's "
+        "own credit with 4.5–5.5 years left; legs of credit-index trades, novations, modifications and "
+        "unwind fees are left out, as are single prints far out of line with the trades around them. "
+        "A trade prices from its quoted spread or from its up-front payment and exact size. DTCC reports "
+        "the up-front as net cash, after the accrued coupon the seller hands back, without saying who paid "
+        "it; that is settled by quoted spreads and by how prices behave across quarterly coupon dates, and "
+        "where the data don't settle it both readings are shown. Some spreads are reported 100 times too "
+        f"small; these are scaled up only when they match properly reported quotes within {cds_signal.RESCALE_DAYS} "
+        "days. Reported levels are converted to probabilities with the same assumptions. Method and checks: "
+        "cds/CDS_VALIDATION.md in the project.</p>")
 
 
 def block_weak_borrowers():
-    rows = []
+    rows, moves, last_day = [], {}, None
     for ticker in WEAK_BORROWERS + ["QQQ"]:
-        closes = [c for _, c in yahoo_closes(ticker)]
-        last = closes[-1]
+        series = yahoo_closes(ticker)
+        closes = [c for _, c in series]
+        last, last_day = closes[-1], series[-1][0]
         r1m = (last / closes[-22] - 1) * 100 if len(closes) > 22 else None
         r3m = (last / closes[-64] - 1) * 100 if len(closes) > 64 else None
         dd = (last / max(closes) - 1) * 100
+        moves[ticker] = r1m
         label = "QQQ (Nasdaq-100, for comparison)" if ticker == "QQQ" else ticker
         rows.append([label, f"{last:,.2f}", pct(r1m), pct(r3m), pct(dd)])
-    out = table(["Ticker", "Last close", "1 month", "3 months", "From 52-week high"], rows)
-    out += no_line(
-        "These are the weakest borrowers in Ares's map (CoreWeave and the former bitcoin miners) "
-        "plus Oracle. Their stocks are a free stand-in for their bond prices, which usually move "
-        "first but aren't freely available. They routinely swing 50% or more without any credit "
-        "event, so a fixed line would fire constantly. Worry when they fall together while QQQ "
-        "holds up, which points to the AI financing chain and not the whole market. Also worry "
-        "when a fall comes with news of a pulled bond deal, a downgrade or a covenant problem "
-        "(see headlines below).")
+    out = table(["Ticker", f"Close ({esc(last_day)})", "1 month", "3 months", "From 52-week high"], rows)
+    group = [t for t in WEAK_BORROWERS if t != "ORCL" and moves.get(t) is not None]
+    basket = st.mean(moves[t] for t in group) if group else None
+    fell = [t for t in group if moves[t] <= -WEAK_EACH_PCT]
+    qqq = moves.get("QQQ")
+    crossed = (None if basket is None or qqq is None
+               else basket <= -WEAK_BASKET_PCT and len(fell) >= 4 and qqq > -QQQ_CALM_PCT)
+    out += line(
+        f"the former bitcoin miners and CoreWeave fall together while the market holds up: over a "
+        f"month, the six ({', '.join(group)}) are down {WEAK_BASKET_PCT}% or more on average, at least "
+        f"four of them by {WEAK_EACH_PCT}% or more, while QQQ is down less than {QQQ_CALM_PCT}%. Ares "
+        "profiles these miners as having gone \"from bitcoin miner to investment grade issuer in three "
+        "years (or less)\", and CoreWeave as one of the largest borrowers in GPU financing; Oracle is "
+        "shown for comparison. Their stocks are a free stand-in for their bond prices, which usually "
+        "move first but aren't freely available, and they routinely swing 50% or more without any "
+        "credit event. A fall that comes with news of a pulled bond deal, a downgrade or a covenant "
+        "problem (see the headlines below) matters more.",
+        crossed, (f"Over the last month: the six {basket:+.1f}% on average, {len(fell)} down "
+                  f"{WEAK_EACH_PCT}% or more, QQQ {qqq:+.1f}%." if crossed is not None else ""))
     return out + source("Yahoo Finance daily closes", "https://finance.yahoo.com/")
 
 
@@ -685,7 +1069,9 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
     ("B", "Capex guidance",
      ["(Microsoft OR Alphabet OR Amazon OR Meta OR Oracle) capex (cut OR cuts OR lower OR "
       "reduce OR slows OR guidance) when:30d"],
-     "Microsoft, Alphabet, Amazon, Meta or Oracle lowering its capex plan or guidance",
+     "Microsoft, Alphabet, Amazon, Meta or Oracle lowering its plan or guidance for future capital "
+     "spending (not one quarter's spending coming in below analysts' estimates, and not an "
+     "accounting reclassification of the same spending)",
      "That is the board-level shift Ares says would set off the guarantees, and it reaches the "
      "news months before the filings."),
     ("C", "OpenAI and Anthropic",
@@ -700,7 +1086,9 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
       "covenant OR refinancing OR default OR notes OR bond) when:30d"],
      "CoreWeave or a former bitcoin miner (IREN, TeraWulf, Cipher, Hut 8, Applied Digital) "
      "getting a credit-rating or bond downgrade, missing a payment, breaching or waiving a "
-     "covenant, or pulling a bond deal or pricing one at a much higher yield",
+     "covenant, pulling a bond deal or pricing one at a much higher yield, or its bonds or loans "
+     "being reported as trading at distressed levels (for example below 80 cents on the dollar or "
+     "yielding over 12%), or its credit default swaps above 1,000 basis points",
      "These borrowers have to keep refinancing, so trouble shows here first."),
     ("E", "Rating agencies",
      ['(Moody\'s OR "S&P Global Ratings" OR Fitch) ("data center" OR hyperscaler OR GPU) '
@@ -737,10 +1125,15 @@ write exactly one line, in one of these forms:
 <id> SAME <headline id>               same event as a new headline that starts a story
 <id> NEW ALERT | <label> | <reason>   starts a new story that should be flagged
 <id> NEW OK | <label>                 starts a new story that should not be flagged
+Some sections also list stories to re-judge, because many new reports have joined them since \
+they were judged; their recent headlines are shown. For each, write one line:
+<story id> JUDGE ALERT | <label> | <reason>   or   <story id> JUDGE OK | <label>
 <label> names the event in at most 10 words; <reason> says why it is flagged in at most \
 12 words. Write nothing else."""
 
 SLICE_EDGES = [0, 1, 3, 7, 14]  # days back; a search that hits Google's cap is split here
+REJUDGE_MIN_NEW = 5  # a story with this many reports added since it was judged is judged again
+NEW_DAYS = 3  # a story counts as new only if first reported within this many days
 
 
 def headline_key(title):
@@ -763,13 +1156,13 @@ def search(query):
     Google returns at most 100 results per search, so a busy search is split into
     slices to reach back over the whole window."""
     days = window_days(query)
-    oldest = datetime.now(timezone.utc) - timedelta(days=days)
+    oldest = NOW - timedelta(days=days)
     within = lambda items: [h for h in items if h["when"] >= oldest]  # when:Nd is loose
     first = news(query)
     if len(first) < 95:
         return [within(first)]
     base = re.sub(r"\s*when:\d+d", "", query)
-    today = date.today()
+    today = TODAY
     edges = [e for e in SLICE_EDGES if e < days] + [days]
     return [within(news(f"{base} after:{(today - timedelta(days=far)).isoformat()} "
                         f"before:{(today - timedelta(days=near - 1)).isoformat()}"))
@@ -777,22 +1170,14 @@ def search(query):
 
 
 def load_store(today):
-    try:
-        with open(HEADLINE_STORE) as f:
-            store = json.load(f)
-    except (OSError, ValueError):
-        store = {"created": today}
-    for k, v in (("next_story", 1), ("items", {}), ("stories", {})):
+    store = load_json_store(HEADLINE_STORE) or {"created": today}
+    for k, v in (("created", today), ("next_story", 1), ("items", {}), ("stories", {})):
         store.setdefault(k, v)
     return store
 
 
 def save_store(store):
-    os.makedirs(os.path.dirname(HEADLINE_STORE), exist_ok=True)
-    tmp = HEADLINE_STORE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(store, f)
-    os.replace(tmp, HEADLINE_STORE)
+    save_json_store(HEADLINE_STORE, store)
 
 
 def cap_round_robin(lists, limit):
@@ -821,17 +1206,21 @@ def check_model(task):
 
 def classify(sections):
     """One DeepSeek call that groups and judges every new headline.
-    `sections` is [(feed id, [(story id, story)], [new headline])].
-    Returns ({id: (verdict, label, reason)} for new stories, {id: reference} for
-    same-event lines, tokens used)."""
+    `sections` is [(feed id, [(story id, story)], [new headline], [(story id, story, [headline])])],
+    the last list being stories to re-judge. Returns ({id: (verdict, label, reason)} for new
+    stories and re-judged ones, {id: reference} for same-event lines, tokens used)."""
     check_model("classification")
     parts = []
-    for fid, known_stories, new in sections:
+    for fid, known_stories, new, rejudge in sections:
         text = f"## {FEEDS[fid][1]}\nFlag when: {FEEDS[fid][3]}\n\nKnown stories:\n"
         text += "\n".join(f"{sid} [{'flagged' if s['verdict'] == 'alert' else 'not flagged'}] "
                           f"{s['label']}" for sid, s in known_stories) or "(none)"
         text += "\n\nNew headlines:\n"
-        text += "\n".join(f"{h['id']}. {h['title']} ({h['date']})" for h in new)
+        text += "\n".join(f"{h['id']}. {h['title']} ({h['date']})" for h in new) or "(none)"
+        if rejudge:
+            text += "\n\nStories to re-judge:\n" + "\n".join(
+                f"{sid} [{'flagged' if st_['verdict'] == 'alert' else 'not flagged'}] {st_['label']}: "
+                + " / ".join(f"{h['title']} ({h['date']})" for h in hs[-8:]) for sid, st_, hs in rejudge)
         parts.append(text)
     r = deepseek("/chat/completions", {
         "model": DEEPSEEK_MODEL, "reasoning_effort": "high", "max_tokens": 64000,
@@ -842,6 +1231,10 @@ def classify(sections):
         raise RuntimeError(f"the model stopped early ({choice.get('finish_reason')})")
     new_stories, same = {}, {}
     for row in (choice["message"].get("content") or "").splitlines():
+        m = re.match(r"\s*(S\d+)\s+JUDGE\s+(ALERT|OK)\s*\|\s*([^|]*?)\s*(?:\|\s*(.*?))?\s*$", row)
+        if m:
+            new_stories[m.group(1)] = (m.group(2), m.group(3), m.group(4) or "")
+            continue
         m = re.match(r"\s*([A-F]\d+)\s+NEW\s+(ALERT|OK)\s*\|\s*([^|]*?)\s*(?:\|\s*(.*?))?\s*$", row)
         if m:
             new_stories[m.group(1)] = (m.group(2), m.group(3), m.group(4) or "")
@@ -858,20 +1251,21 @@ def classify(sections):
 def headlines():
     """Fetches every feed once, groups headlines about the same event into stories,
     and judges new headlines in a single DeepSeek call. Results are remembered, so
-    each headline is judged once. Returns ({feed id: {"stories": [...],
-    "error": str or None}}, status note)."""
-    today = date.today().isoformat()
+    each headline is judged once; a story that gains REJUDGE_MIN_NEW reports after it was
+    judged is judged again. Returns ({feed id: {"stories": [...], "error": str or None,
+    "capped": bool}}, status note)."""
+    today = TODAY.isoformat()
     store = load_store(today)
     known, stories = store["items"], store["stories"]
 
     # One bucket per feed and date slice, so the cap trims evenly across both.
-    buckets, errors, taken = [], {fid: [] for fid in FEEDS}, set()
+    buckets, errors, taken, available = [], {fid: [] for fid in FEEDS}, set(), {fid: 0 for fid in FEEDS}
     for fid, _, queries, _, _ in HEADLINE_FEEDS:
         for q in queries:
             try:
                 slices = search(q)
             except Exception as e:
-                errors[fid].append(str(e))
+                errors[fid].append(short_error(e))
                 continue
             for part in slices:
                 bucket = []
@@ -880,39 +1274,72 @@ def headlines():
                     if k not in taken:
                         taken.add(k)
                         bucket.append(dict(h, key=k, feed=fid))
+                available[fid] += len(bucket)
                 buckets.append(bucket)
     picked = [h for b in cap_round_robin(buckets, MAX_HEADLINES) for h in b]
 
-    by_feed, pending = {}, []
+    current = lambda sid, fid: (sid in stories and stories[sid]["feed"] == fid
+                                and stories[sid]["criteria"] == criteria_hash(fid))
+    same_title = lambda key: key.rsplit(" - ", 1)[0]  # the same headline from another outlet
+    by_feed, pending, twins = {}, [], {}
     for fid in FEEDS:
         items = sorted((h for h in picked if h["feed"] == fid), key=lambda h: h["when"],
                        reverse=True)
+        by_title = {same_title(h["key"]): known[h["key"]]["story"] for h in items
+                    if h["key"] in known and current(known[h["key"]].get("story"), fid)}
+        first_of = {}
         for n, h in enumerate(items, 1):
             h.update(id=f"{fid}{n}", date=h["when"].date().isoformat())
             rec = known.setdefault(h["key"], {"first_seen": today})
             rec["last_seen"] = today
-            story = stories.get(rec.get("story"))
-            if not (story and story["feed"] == fid and story["criteria"] == criteria_hash(fid)):
-                rec.pop("story", None)
+            if current(rec.get("story"), fid):
+                continue
+            rec.pop("story", None)
+            t = same_title(h["key"])
+            if t in by_title:          # syndicated copy of a judged headline: same story
+                rec["story"] = by_title[t]
+            elif t in first_of:        # syndicated copy of another new headline: follows it
+                twins[h["id"]] = first_of[t]
+            else:
+                first_of[t] = h["id"]
                 pending.append(h)
         by_feed[fid] = items
 
+    # Stories that have gained many reports since they were judged get judged again.
+    size = {}
+    for items in by_feed.values():
+        for h in items:
+            sid = known[h["key"]].get("story")
+            if sid:
+                size[sid] = size.get(sid, 0) + 1
+    rejudge = {}
+    for sid, n in size.items():
+        st_ = stories[sid]
+        st_.setdefault("judged_size", n)
+        if n >= st_["judged_size"] + REJUDGE_MIN_NEW:
+            hs = sorted((h for h in by_feed[st_["feed"]] if known[h["key"]].get("story") == sid), key=lambda h: h["when"])
+            rejudge.setdefault(st_["feed"], []).append((sid, st_, hs))
+
     total = len(picked)
     status = f"{total} headlines."
-    if pending:
+    if pending or rejudge:
         sections = []
         for fid, items in by_feed.items():
-            new = [h for h in items if "story" not in known[h["key"]]]
-            if new:
+            new = [h for h in items if h in pending]
+            if new or rejudge.get(fid):
                 sids = dict.fromkeys(known[h["key"]]["story"] for h in items
                                      if "story" in known[h["key"]])
-                sections.append((fid, [(sid, stories[sid]) for sid in sids], new))
+                sections.append((fid, [(sid, stories[sid]) for sid in sids], new, rejudge.get(fid, [])))
         try:
-            new_stories, same, tokens = classify(sections)
+            verdicts, same, tokens = classify(sections)
             ids = {h["id"]: h for h in pending}
-            assigned = {}
-            for hid, (verdict, label, reason) in new_stories.items():
-                if hid in ids:
+            assigned, rejudged = {}, 0
+            for hid, (verdict, label, reason) in verdicts.items():
+                if hid.startswith("S") and hid in size:  # a re-judged story
+                    stories[hid].update(label=label, reason=reason, judged_size=size[hid],
+                                        verdict="alert" if verdict == "ALERT" else "ok")
+                    rejudged += 1
+                elif hid in ids:
                     sid = f"S{store['next_story']}"
                     store["next_story"] += 1
                     stories[sid] = {"feed": hid[0], "label": label, "reason": reason,
@@ -922,22 +1349,30 @@ def headlines():
             for _ in range(5):  # a SAME line can point at another SAME line
                 for hid, ref in same.items():
                     sid = ref if ref.startswith("S") else assigned.get(ref)
-                    if (hid in ids and hid not in assigned and sid in stories
-                            and stories[sid]["feed"] == hid[0]
-                            and stories[sid]["criteria"] == criteria_hash(hid[0])):
+                    if hid in ids and hid not in assigned and current(sid, hid[0]):
                         assigned[hid] = sid
+            for hid, first in twins.items():
+                if first in assigned:
+                    assigned[hid] = assigned[first]
+            every = {h["id"]: h for items in by_feed.values() for h in items}
             for hid, sid in assigned.items():
-                known[ids[hid]["key"]]["story"] = sid
-            status += (f" Judged {len(assigned)} new ones in one call ({tokens:,} tokens).")
-            if len(assigned) < len(pending):
-                status += (f" {len(pending) - len(assigned)} were missing from the reply and "
+                known[every[hid]["key"]]["story"] = sid
+            for sid in set(assigned.values()):
+                stories[sid].setdefault("judged_size", sum(1 for x in assigned.values() if x == sid))
+            status += f" Judged {len(assigned)} new ones in one call ({tokens:,} tokens)."
+            if rejudged:
+                status += f" Re-judged {rejudged} stor{'y' if rejudged == 1 else 'ies'} that had gained {REJUDGE_MIN_NEW}+ reports."
+            if len(assigned) < len(pending) + len(twins):
+                status += (f" {len(pending) + len(twins) - len(assigned)} were missing from the reply and "
                            "will be retried on the next run.")
         except Exception as e:
-            status += f" {len(pending)} new ones couldn't be judged today: {e}"
+            status += f" {len(pending)} new ones couldn't be judged today: {short_error(e)}"
     else:
         status += " None new to judge today."
-    if total == MAX_HEADLINES:
-        status += f" Capped at {MAX_HEADLINES}; the oldest in the busiest searches were dropped."
+    capped = {fid for fid in FEEDS if sum(1 for h in picked if h["feed"] == fid) < available[fid]}
+    if capped:
+        status += (f" Capped at {MAX_HEADLINES} headlines in all; the oldest in the busiest searches "
+                   "were dropped.")
 
     feeds = {}
     for fid, items in by_feed.items():
@@ -946,19 +1381,20 @@ def headlines():
             groups.setdefault(known[h["key"]].get("story") or h["key"], []).append(h)
         out = []
         for gid, hs in groups.items():
-            s = stories.get(gid)
+            s_ = stories.get(gid)
             hs.sort(key=lambda h: h["when"])
             first_seen = min(known[h["key"]]["first_seen"] for h in hs)
-            out.append({"headlines": hs, "verdict": s["verdict"] if s else None,
-                        "reason": s["reason"] if s else "", "latest": hs[-1]["when"],
-                        "new": first_seen == today and today != store["created"]})
+            fresh = hs[0]["when"] >= NOW - timedelta(days=NEW_DAYS)
+            out.append({"headlines": hs, "verdict": s_["verdict"] if s_ else None,
+                        "reason": s_["reason"] if s_ else "", "latest": hs[-1]["when"],
+                        "new": first_seen == today and today != store["created"] and fresh})
         out.sort(key=lambda g: g["latest"], reverse=True)
-        feeds[fid] = {"stories": out, "error": "; ".join(errors[fid]) or None}
+        feeds[fid] = {"stories": out, "error": "; ".join(errors[fid]) or None, "capped": fid in capped}
 
-    cutoff = (date.today() - timedelta(days=STORE_DAYS)).isoformat()
+    cutoff = (TODAY - timedelta(days=STORE_DAYS)).isoformat()
     store["items"] = {k: v for k, v in known.items() if v.get("last_seen", "") >= cutoff}
     used = {v.get("story") for v in store["items"].values()}
-    store["stories"] = {sid: s for sid, s in stories.items() if sid in used}
+    store["stories"] = {sid: s_ for sid, s_ in stories.items() if sid in used}
     save_store(store)
     return feeds, status
 
@@ -991,8 +1427,11 @@ def feed_block(fid):
     rest = [s for s in items if s["verdict"] != "alert"]
     unjudged = [s for s in items if s["verdict"] is None]
     n_headlines = sum(len(s["headlines"]) for s in items)
-    out = f'<p class="muted">Last {window_days(FEEDS[fid][2][0])} days: '
-    out += f"{n_headlines} headlines grouped into {len(items)} stories.</p>"
+    dates = sorted(h["date"] for s_ in items for h in s_["headlines"])
+    span = f"from {dates[0]} to {dates[-1]}" if dates else "none found"
+    out = (f'<p class="muted">{n_headlines} headlines {span}, grouped into {len(items)} stories'
+           + (f" (searches cover the last {window_days(FEEDS[fid][2][0])} days, but the cap on headlines "
+              "dropped the oldest here)" if feed["capped"] else "") + ".</p>")
     if feed["error"]:
         out += f'<p class="error">Some searches failed today: {esc(feed["error"])}</p>'
     if flagged:
@@ -1014,7 +1453,9 @@ def feed_block(fid):
     if unjudged:
         detail.append(f"{len(unjudged)} headlines not judged yet (see the note at the top of "
                       "the Headlines section).")
-    crossed = True if flagged else (None if unjudged else False)
+    if feed["error"] and not flagged:
+        detail.append("Some searches failed, so stories may be missing: check by hand.")
+    crossed = True if flagged else (None if unjudged or feed["error"] else False)
     return out, crossed, " ".join(detail)
 
 
@@ -1033,6 +1474,9 @@ QUARTER_WORDS = {1: "first quarter", 2: "second quarter", 3: "third quarter", 4:
 UP_WORDS = ("increase", "higher", "above", "up", "jump", "rose", "grew", "growth", "gain", "rise")
 DOWN_WORDS = ("decrease", "lower", "below", "down", "fell", "decline", "drop", "slip", "dip")
 STATUS_RANK = {"final": 1, "preliminary": 0}
+LIMRA_CHANGE_SLACK = 3  # points a stated change may differ from the one computed from the totals
+LIMRA_LAG_DAYS = 40     # days after a quarter ends by which LIMRA has published preliminary figures
+LIMRA_LEAD_CHARS = 600  # a release's opening lines, which report total sales before any product line
 
 LIMRA_INSTRUCTIONS = """\
 You extract figures from a LIMRA news release about U.S. annuity sales.
@@ -1054,20 +1498,54 @@ If the release states no single-quarter total, output only: NONE"""
 
 
 def release_text(raw):
-    """Plain text of a LIMRA release page from its dateline on, plus the release date."""
+    """(plain text of a LIMRA release from its dateline on, release date, year LIMRA's sales
+    definition changed if the release says so). The date comes from the dateline ("WINDSOR,
+    Conn., June 11, 2026 —"), falling back to the page's own date."""
     s = re.sub(r"(?s)<(script|style).*?</\1>", " ", raw.decode("utf-8", "replace"))
     t = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", s)).split())
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b", t)
-    released = date(int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else None
+    released = None
+    m = re.search(r"WINDSOR, Conn\.,?\s*([A-Z][a-z]+)\.?\s+(\d{1,2}),\s*(20\d\d)", t)
+    if m:
+        for fmt in ("%B %d %Y", "%b %d %Y"):
+            try:
+                released = datetime.strptime(f"{m.group(1)[:3] if fmt == '%b %d %Y' else m.group(1)} {m.group(2)} {m.group(3)}", fmt).date()
+                break
+            except ValueError:
+                pass
+    if released is None:
+        m = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d\d)\b", t)
+        released = date(int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else None
+    d = re.search(r"Beginning with the \w+ (20\d\d) report, LIMRA updated its sales definition", t)
     i = t.find("WINDSOR, Conn.")
-    return (t[i:] if i >= 0 else t)[:15000], released
+    return (t[i:] if i >= 0 else t)[:15000], released, int(d.group(1)) if d else None
 
 
-def parse_change(change, evidence):
-    """Signed % change from the CHANGE field, or None unless it is stated unambiguously in the
-    evidence sentence."""
+ABBREVIATIONS = re.compile(r"\b(U\.S|Inc|Conn|Corp|Co|No|vs|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.")
+PRODUCT_WORDS = re.compile(r"\b(fixed[- ]indexed|indexed|variable|fixed[- ]rate|fixed|registered|rila|fia|frd|va|"
+                           r"spia|dia|income|immediate|deferred|traditional|structured|buffer)\b")
+PART_YEAR = re.compile(r"first half|six months|nine months|year[- ]to[- ]date|\bYTD\b|full[- ]year|for the year|annual",
+                       re.I)
+
+
+def yoy_cue(year, q):
+    """Words that tie a change to the same quarter a year earlier."""
+    w = QUARTER_WORDS[q]
+    return re.compile(rf"year[- ]over[- ]year|same (period|quarter)|prior[- ]year|(a|the) year (earlier|ago|before)|"
+                      rf"{w}( of)? {year - 1}|{w} {year - 1}", re.I)
+
+
+def parse_change(change, evidence, year=None, q=None):
+    """Signed % change from the CHANGE field, or None unless the evidence sentence states it
+    unambiguously as a change from the same quarter a year earlier."""
     if not change or change.upper() == "NONE" or change not in evidence:
         return None
+    if year is not None:
+        # The year-ago reference has to sit in the change's own clause: "up 17% from the first
+        # quarter and down 9% from the second quarter of 2025" makes only the second one count.
+        pos = evidence.index(change)
+        clause = change + re.split(r",| and | but |;", evidence[pos + len(change):], maxsplit=1)[0]
+        if not yoy_cue(year, q).search(clause):
+            return None
     low = change.lower()
     if re.search(r"\b(level|flat|unchanged)\b", low) and "%" not in low:
         return 0.0
@@ -1082,7 +1560,9 @@ def parse_change(change, evidence):
 
 
 def verify_quarter(line, text, released):
-    """One model line -> {quarter, total, yoy, evidence} if it checks out against the text."""
+    """One model line -> {quarter, total, yoy, evidence} if it checks out against the text: the
+    evidence is a single sentence copied word for word, about total annuity sales (not a product
+    line, a half-year or year-to-date figure), naming the quarter and containing the exact total."""
     m = re.match(r"\s*(?:[-*•]\s*)?(?:QUARTER\s+)?(20\d\d)-Q([1-4])\s*\|\s*TOTAL\s+\$([\d.,]+)\s*billion\s*\|"
                  r"\s*CHANGE\s+(.*?)\s*\|\s*EVIDENCE\s+(.+?)\s*$", line)
     if not m:
@@ -1090,23 +1570,33 @@ def verify_quarter(line, text, released):
     year, q, total_s, change, evidence = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4), m.group(5)
     evidence = evidence.strip('"“” ')
     total = float(total_s.replace(",", ""))
+    masked = ABBREVIATIONS.sub(r"\1", evidence).rstrip('.”" ')
+    # About total sales: "annuity sales" with no product name in front, or, in the release's
+    # opening lines (which report totals before any product line), "sales" with none.
+    i = evidence.lower().find("annuity sales")
+    if i < 0 and 0 <= text.find(evidence) < LIMRA_LEAD_CHARS:
+        i = evidence.lower().find("sales")
     ok = (evidence in text                                      # copied, not paraphrased
+          and len(evidence) <= 400
+          and not re.search(r"[.!?][”\"']?\s+[A-Z“\"]", masked)  # one sentence, not a stretch of text
           and f"${total_s} billion" in evidence                 # the total is in that sentence
           and QUARTER_WORDS[q] in evidence.lower()              # and so is the quarter
+          and i >= 0 and not PRODUCT_WORDS.search(evidence.lower()[max(0, i - 40):i])  # total sales
+          and not PART_YEAR.search(evidence)                    # not a half-year or year-to-date total
           and 50 <= total <= 300                                # a market total, not a product line
           and released is not None and year in (released.year, released.year - 1))
     if not ok:
         return None
-    return dict(quarter=f"{year}-Q{q}", total=total, yoy=parse_change(change, evidence), evidence=evidence)
+    return dict(quarter=f"{year}-Q{q}", total=total, yoy=parse_change(change, evidence, year, q), evidence=evidence)
 
 
 def read_release(url):
     """Fetches one release and extracts its quarterly totals with DeepSeek."""
-    text, released = release_text(fetch(url))
+    text, released, definition = release_text(fetch(url))
     # Early figures say "according to preliminary results"; later releases revise them.
     status = "preliminary" if re.search(r"\bpreliminary results\b", text, re.I) else "final"
     rec = dict(released=released.isoformat() if released else None, status=status, quarters=[],
-               model=DEEPSEEK_MODEL_NAME)
+               definition_change=definition, model=DEEPSEEK_MODEL_NAME)
     if released is None:
         return rec
     check_model("reading LIMRA releases")
@@ -1128,19 +1618,18 @@ def read_release(url):
 
 
 def limra_quarters():
-    """({quarter: chosen figure}, [problems]) from every annuity sales release in the window. Per
-    quarter, a final figure beats a preliminary one, then the later release wins."""
-    try:
-        with open(LIMRA_STORE) as f:
-            store = json.load(f)
-    except (OSError, ValueError):
-        store = {}
+    """({quarter: chosen figure}, [problems], info) from every annuity release in the window. Per
+    quarter, a final figure beats a preliminary one, then the later release wins. info holds the
+    year LIMRA changed its sales definition (or None), how far final changes have moved from
+    preliminary ones, and how many figures failed the checks. A stated change that disagrees
+    with the two totals by more than LIMRA_CHANGE_SLACK points is dropped."""
+    store = load_json_store(LIMRA_STORE)
     problems = []
-    first_year = date.today().year - LIMRA_YEARS
+    first_year = TODAY.year - LIMRA_YEARS
     xml = fetch(LIMRA_SITEMAP).decode("utf-8", "replace")
     for url in re.findall(r"<loc>([^<]+)</loc>", xml):
         low = url.lower()
-        if "/newsroom/news-releases/" not in low or "annuit" not in low or "sales" not in low:
+        if "/newsroom/news-releases/" not in low or "annuit" not in low:
             continue
         y = re.search(r"/news-releases/(20\d\d)/", url)
         if url in store or (y and int(y.group(1)) < first_year):
@@ -1148,23 +1637,36 @@ def limra_quarters():
         try:
             store[url] = read_release(url)
         except Exception as e:  # leave it out of the store so the next run tries again
-            problems.append(f"{url}: {e}")
-    os.makedirs(os.path.dirname(LIMRA_STORE), exist_ok=True)
-    with open(LIMRA_STORE, "w") as f:
-        json.dump(store, f, indent=1)
-    best = {}
+            problems.append(f"{url}: {short_error(e)}")
+    save_json_store(LIMRA_STORE, store)
+    best, by_quarter = {}, {}
     for url, rec in store.items():
         for q in rec["quarters"]:
             cand = dict(q, url=url, status=rec["status"], released=rec["released"])
+            by_quarter.setdefault(q["quarter"], []).append(cand)
             key = (STATUS_RANK[rec["status"]], rec["released"] or "")
             cur = best.get(q["quarter"])
             if cur is None or key > (STATUS_RANK[cur["status"]], cur["released"] or ""):
                 best[q["quarter"]] = cand
-    for q, v in best.items():  # fill a missing change from the same quarter a year earlier
+    breaks = [rec.get("definition_change") for rec in store.values() if rec.get("definition_change")]
+    definition = min(breaks) if breaks else None
+    across = lambda q: definition is not None and int(q[:4]) == definition  # compares new with old
+    for q, v in best.items():
         prev = best.get(f"{int(q[:4]) - 1}{q[4:]}")
-        if v["yoy"] is None and prev:
-            v["yoy"], v["computed"] = (v["total"] / prev["total"] - 1) * 100, True
-    return best, problems
+        if prev and not across(q):
+            computed = (v["total"] / prev["total"] - 1) * 100
+            if v["yoy"] is None:
+                v["yoy"], v["computed"] = computed, True
+            elif abs(v["yoy"] - computed) > LIMRA_CHANGE_SLACK:
+                problems.append(f"{q}: LIMRA's stated change ({v['yoy']:+.0f}%) doesn't match its totals "
+                                f"({computed:+.0f}%), so it isn't used")
+                v["yoy"] = None
+    revisions = [abs(f["yoy"] - p["yoy"]) for vs in by_quarter.values()
+                 for f in vs if f["status"] == "final" and f["yoy"] is not None
+                 for p in vs if p["status"] == "preliminary" and p["yoy"] is not None]
+    rejected = sum(len(rec.get("rejected", [])) for rec in store.values()
+                   if (rec.get("released") or "") >= f"{first_year + 1}")
+    return best, problems, dict(definition=definition, revision=max(revisions, default=None), rejected=rejected)
 
 
 def next_quarter(q):
@@ -1177,40 +1679,72 @@ def quarter_end(q):
     return date(y + n // 4, n % 4 * 3 + 1, 1) - timedelta(days=1)
 
 
+def expected_limra_quarter(today):
+    """The newest quarter LIMRA should have reported by today: preliminary figures come about
+    four weeks after a quarter ends."""
+    y, n = today.year, (today.month - 1) // 3  # quarters fully ended this year
+    q = f"{y}-Q{n}" if n else f"{y - 1}-Q4"
+    if (today - quarter_end(q)).days < LIMRA_LAG_DAYS:
+        q = f"{int(q[:4]) - 1}-Q4" if q[-1] == "1" else f"{q[:4]}-Q{int(q[-1]) - 1}"
+    return q
+
+
+def fmt_change(v):
+    """A whole-percent change with its sign, and plain "0%" when it rounds to zero."""
+    return "0%" if round(v) == 0 else f"{v:+.0f}%"
+
+
 def block_annuities():
     rule = ("LIMRA's quarterly total U.S. annuity sales come in below the same quarter a year "
             "earlier, two quarters in a row. Annuity sales bring in much of the insurer money that "
             "Ares says buys the investment-grade AI debt (its first flow).")
     try:
-        best, problems = limra_quarters()
+        best, problems, info = limra_quarters()
     except Exception as e:
-        best, problems = {}, [f"LIMRA releases unavailable today: {e}"]
+        best, problems, info = {}, [f"LIMRA releases unavailable today: {short_error(e)}"], {}
+    definition = info.get("definition")
+    across = lambda q: definition is not None and int(q[:4]) == definition
     out = ""
     quarters = sorted(best)
     if quarters:
         rows = []
         for q in reversed(quarters[-6:]):
             v = best[q]
-            yoy = ("not stated" if v["yoy"] is None else "0%" if round(v["yoy"]) == 0 else f"{v['yoy']:+.0f}%") + (" (computed)" if v.get("computed") else "")
+            yoy = "not stated" if v["yoy"] is None else fmt_change(v["yoy"]) + (" (computed)" if v.get("computed") else "")
             if v["yoy"] is not None and v["yoy"] < 0:
                 yoy = f'<span class="bad">{yoy}</span>'
+            if across(q) and v["yoy"] is not None:
+                yoy += " †"
             rows.append([f"Q{q[-1]} {q[:4]}", f"${v['total']:,.1f}B", yoy, v["status"],
                          f'<a href="{esc(v["url"])}">{esc(v["released"])}</a>'])
         out += table(["Quarter", "Total U.S. annuity sales", "vs. same quarter a year earlier",
                       "Figures", "LIMRA release"], rows)
+    expected = expected_limra_quarter(TODAY)
     crossed, detail = None, ""
-    if len(quarters) >= 2:
+    if len(quarters) < 2:
+        detail = "Too few quarters found."
+    elif expected not in best:
+        detail = (f"LIMRA's figures for {expected} should be out by now but weren't found (the release may be "
+                  "missing from LIMRA's sitemap, or its figures failed the checks), so check by hand.")
+    else:
         a, b = best[quarters[-2]], best[quarters[-1]]
         if next_quarter(quarters[-2]) != quarters[-1]:
             detail = f"{quarters[-2]} and {quarters[-1]} aren't consecutive quarters, so check by hand."
         elif a["yoy"] is None or b["yoy"] is None:
-            detail = "A year-over-year change is missing for one of the last two quarters."
-        elif (date.today() - quarter_end(quarters[-1])).days > 150:
-            detail = f"The newest figures found are for {quarters[-1]}, which looks out of date."
+            detail = "A year-over-year change is missing for one of the last two quarters, so check by hand."
+        elif across(quarters[-1]) or across(quarters[-2]):
+            detail = (f"Last two quarters: {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} as LIMRA states them, "
+                      f"but LIMRA changed its sales definition from its January {definition} report (sales now "
+                      "include internal transfers between a company's own contracts), and its "
+                      f"{definition} changes compare with {definition - 1} figures as first published, which may "
+                      "use the old definition. The comparison may not be like for like, so check by hand.")
         else:
             crossed = a["yoy"] < 0 and b["yoy"] < 0
-            detail = (f"Last two quarters: {a['yoy']:+.0f}% and {b['yoy']:+.0f}% year over year"
-                      + (" (latest figures preliminary)." if b["status"] == "preliminary" else "."))
+            detail = f"Last two quarters: {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} year over year."
+            if b["status"] == "preliminary":
+                rev = info.get("revision")
+                detail += (" The latest figures are preliminary" +
+                           (f"; LIMRA's final figures have moved such changes by up to {rev:.0f} points." if rev else "."))
     out += line(rule, crossed, detail)
     for p in problems:
         out += f'<p class="error">{esc(p)}</p>'
@@ -1218,20 +1752,28 @@ def block_annuities():
     out += f"<h4>Annuity sales news</h4>{news}"
     if news_detail:
         out += f'<p class="muted">{news_detail}</p>'
+    rejected = info.get("rejected")
     return out + (
         '<p class="muted">Source: <a href="https://www.limra.com/en/newsroom/news-releases/">LIMRA '
         "news releases</a>, found through LIMRA's sitemap. "
         f"{esc(DEEPSEEK_MODEL_NAME)} copies each quarter's total and year-over-year change from the "
         "release text; a figure is used only if the sentence it quotes appears in the release word "
-        "for word and contains that exact total and quarter. Final figures replace preliminary "
-        "ones. If anything is missing or out of date, the line falls back to checking by hand.</p>")
+        "for word, is a single sentence about total annuity sales (not a product line, half-year or "
+        "year-to-date figure), and contains that exact total and quarter, and a change only if the "
+        "sentence ties it to the same quarter a year earlier and it agrees with the totals. Final "
+        "figures replace preliminary ones. If anything is missing, out of date or not like for like, "
+        "the line falls back to checking by hand."
+        + (f" {rejected} figure{'s' * (rejected != 1)} read from recent releases failed the checks and "
+           f"{'were' if rejected != 1 else 'was'} left out." if rejected else "")
+        + (" † compares across LIMRA's change of definition." if definition else "") + "</p>")
 
 
 def block_news():
     out = ('<p class="muted">Headlines reporting the same event are grouped into one story, '
            "listed under its first report. ALERT = "
            f"{esc(DEEPSEEK_MODEL_NAME)} judged that the story is a concrete event matching "
-           "that section's line. NEW = first reported today. "
+           f"that section's line; it can be wrong, so read the story. NEW = first seen by this dashboard "
+           f"today and first reported in the last {NEW_DAYS} days. "
            f"{esc(headlines()[1])}</p>")
     for fid in "ABCDE":
         _, title, _, flag_when, why = FEEDS[fid]
@@ -1247,11 +1789,12 @@ SECTIONS = [
         ("Nvidia revenue", block_nvidia),
         ("Contract backlog at Oracle, Microsoft and Alphabet", block_backlog),
         ("GPU rental prices", block_gpu_prices),
+        ("Commitments not on the balance sheet", block_commitments),
     ]),
     ("2. Credit", [
         ("Corporate bond spreads", block_spreads),
         ("Credit default swaps: market-implied default probability", block_cds),
-        ("Weakest AI borrowers (stock prices)", block_weak_borrowers),
+        ("Most heavily borrowed AI names (stock prices)", block_weak_borrowers),
     ]),
     ("3. Insurance", [
         ("Annuity sales", block_annuities),
@@ -1262,13 +1805,13 @@ SECTIONS = [
 ]
 
 NOT_HERE = (
-    "No free source exists for: prices of the private placements and securitizations, the contract exit clauses inside individual deals, "
-    "insurers' return on equity, and the off-balance-sheet commitments Ares cites: data-center "
-    "leases signed but not yet started, and take-or-pay contracts for power and capacity. Those "
-    "appear only in the text of filing footnotes, not in the tagged figures this dashboard reads "
-    "(leases already started are tagged, but they sit on the balance sheet). The capex and backlog figures lag by one to "
-    "three months. Ares's own advice is to cut risk before signals cross, not after: "
-    "\"cycles are easy, but timing is hard.\""
+    "Not tracked here: prices of the private placements and securitizations Ares describes, the exit "
+    "clauses inside individual deals, insurers' return on equity (it is in their filings, but not as "
+    "a comparable tagged figure), Microsoft's and Amazon's off-balance-sheet commitments (not tagged "
+    "comparably), the leases not yet started at Alphabet and Oracle and Nvidia's supply and capacity "
+    "commitments (stated only in the text of their filings). The quarterly company figures lag by up to four months. Ares's own advice is to "
+    "\"reef early\": reduce sail well before the storm arrives, because \"cycles are easy, but timing "
+    "is hard.\""
 )
 
 CSS = """
@@ -1284,6 +1827,8 @@ details{margin:4px 0}
 summary{cursor:pointer;color:#333}
 .line{background:#f6f6f6;padding:6px 8px;margin:6px 0}
 .bad{color:#b00020;font-weight:700}
+.warnings{border:1px solid #b00020;background:#fff5f5;padding:6px 12px;margin:8px 0}
+.warnings ul{margin:4px 0}
 .muted{color:#666;font-size:12px;margin:4px 0}
 h4{font-size:13px;margin:16px 0 2px}
 .legend{font-size:12px;color:#52514e;margin:6px 0}
@@ -1299,45 +1844,51 @@ h4{font-size:13px;margin:16px 0 2px}
 
 
 def main():
-    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    generated = f"{NOW:%Y-%m-%d %H:%M} UTC"
+    out = OUT
     if CACHED:
-        try:
-            with open(FETCHED_AT) as f:
-                fetched = f.read().strip()
-        except OSError:
+        if not os.path.exists(FETCHED_AT):
             sys.exit("No saved responses yet: run once without --cached first.")
-        generated = f"{generated} from data fetched {fetched}"
+        generated = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC from data fetched {generated}"
+        out = PREVIEW  # never the live page
     else:
         os.makedirs(HTTP_CACHE, exist_ok=True)
         with open(FETCHED_AT, "w") as f:
-            f.write(generated)
-    parts = [
+            f.write(f"{NOW:%Y-%m-%d %H:%M}")
+    body = []
+    for heading, blocks in SECTIONS:
+        body.append(f"<h2>{esc(heading)}</h2>")
+        for title, fn in blocks:
+            if title:
+                body.append(f"<h3>{esc(title)}</h3>")
+            try:
+                body.append(fn())
+            except Exception as e:  # one broken source shouldn't sink the page
+                print(f"ERROR in {title or heading}: {e!r}", file=sys.stderr)
+                warn(f"{title or heading}: could not be built today")
+                body.append(f'<p class="error">Could not fetch this signal today: {esc(short_error(e))}</p>')
+    body.append("<h2>Not on this dashboard</h2>")
+    body.append(f"<p>{esc(NOT_HERE)}</p></body></html>")
+    head = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
         f"<title>AI Bubble Watch</title><style>{CSS}</style></head><body>",
         "<h1>AI Bubble Watch</h1>",
-        f'<p class="muted">Generated {generated}. Raw signals from free public sources. '
-        "Each one shows where to start worrying; there is no overall score. Based on Ares's "
-        'Fall 2026 <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
+        f'<p class="muted">Generated {generated}. Signals from free public sources; the CDS, annuity '
+        "and headline sections use a language model (DeepSeek) to read news and LIMRA releases, with the "
+        "checks described there. Each signal shows a line where this dashboard suggests starting to worry; "
+        "these lines are the dashboard's own, not Ares's, and there is no overall score. The signals follow "
+        'Ares\'s Fall 2026 <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
         'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a> newsletter.</p>',
     ]
-    for heading, blocks in SECTIONS:
-        parts.append(f"<h2>{esc(heading)}</h2>")
-        for title, fn in blocks:
-            if title:
-                parts.append(f"<h3>{esc(title)}</h3>")
-            try:
-                parts.append(fn())
-            except Exception as e:  # one broken source shouldn't sink the page
-                parts.append(f'<p class="error">Could not fetch this signal today: {esc(e)}</p>')
-    parts.append("<h2>Not on this dashboard</h2>")
-    parts.append(f"<p>{esc(NOT_HERE)}</p></body></html>")
-
-    tmp = OUT + ".tmp"
+    if WARNINGS:
+        head.append('<div class="warnings"><b>Problems in this run:</b><ul>'
+                    + "".join(f"<li>{esc(w)}</li>" for w in WARNINGS) + "</ul></div>")
+    tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(parts))
-    os.replace(tmp, OUT)
-    print(f"Wrote {OUT}")
+        f.write("\n".join(head + body))
+    os.replace(tmp, out)
+    print(f"Wrote {out}" + (f" with {len(WARNINGS)} warning(s)" if WARNINGS else ""))
 
 
 if __name__ == "__main__":

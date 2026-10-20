@@ -2,192 +2,141 @@
 
 How to check the CDS numbers on the AI bubble dashboard (computed by `cds_signal.py` in this
 folder) against levels published by people with Bloomberg/ICE/Markit access, and what can make
-them wrong. Last full check: 2026-10-18 (results below).
+them wrong. Last full check: 2026-10-20 (results below).
+
+The dashboard now does part of this itself: every 5-year level in `published_levels.csv`, plus
+levels read from news headlines, is drawn on the chart next to the trade-based estimate, and the
+text reports how far apart they are for the levels that were not used to build the method.
 
 ## Quick start
 
 ```
 cd /root/bubble/cds
-python3 cds_check.py ORCL 2026-10-15        # my estimate from trades in the 4 days to that date
+python3 cds_check.py ORCL 2026-10-15        # estimate from trades in the 4 days to that date
 python3 cds_check.py NVDA 2026-07-29 7      # ...or a wider window, for thinly traded names
 python3 cds_check.py --tweet <status id>    # date an X post from the number in its URL
+python3 -m unittest test_cds_signal         # tests
 ```
 
 `cds_check.py` reads only the cached DTCC files (`dtcc_cache/`, refreshed by the dashboard's
-daily cron run). It downloads nothing and doesn't change what the dashboard shows.
+daily cron run). It downloads nothing and doesn't change what the dashboard shows. It prints the
+median 5-year default probability and its 5-year spread, the range and number of trades, the two
+readings for any trades where the data don't say who paid the up-front, and any level in
+`published_levels.csv` within a day of the date.
 
-It prints:
-- the median 5-year default probability and its equivalent spread
-- the range of trade values
-- the trade count
-- how many trades had their payment direction assumed (see distortion 1)
+Published figures are almost always **5-year spreads in basis points**, not probabilities, so
+compare spreads. The code converts between them exactly (flat hazard, 40% recovery, 3.75% flat
+rate): a 5-year spread corresponds to the constant hazard that prices a 5-year contract at zero
+up-front, and P₅ = 1 − e^(−5 × hazard). Roughly, spread ≈ hazard × 0.6, so 288bp → P₅ ≈ 21%.
+When a source quotes a "default probability" itself, check its recovery assumption.
 
-**What the helper does not do:** it doesn't read posts or articles. `--tweet` only decodes the
-number in a post's URL, which encodes when it was posted. That is useful because search results
-often show X posts without a date. Reading the post and noting the company, the level and whether
-it is the 5-year contract is done by hand (or by asking Claude), as is the comparison itself.
+## Adding a published level
 
-Published figures are almost always **5-year spreads in basis points**, not probabilities.
-Compare spreads. Conversion used throughout (flat hazard, 40% recovery):
-
-- spread ≈ hazard × (1 − 0.40), with hazard = −ln(1 − P₅) / 5
-- e.g. 288bp → hazard 4.8%/yr → P₅ = 1 − e^(−0.24) = 21.3%
-
-When a source quotes a "default probability" itself, check whether it uses the same recovery.
-Most quote 40%, but some use simpler ratios, so compare the spread when one is given.
-
-## Procedure
-
-1. **Find published levels** for each name, with dates (sources below). Aim for 3+ per name,
-   spread over the period, and note who the data vendor is.
-2. **Date each one precisely.** For X posts, use `cds_check.py --tweet` on the status ID, or open
-   the post. Posts are often relayed days later. For articles, use the trading day the level
-   refers to, not the publication date.
-3. **Run `cds_check.py`** for the days ending on that date. Use 4 days for liquid periods,
-   7–14 days for NVDA or any month with few trades (n < 5 is noise).
-4. **Record the gap** in the results table below, as a percentage of the published spread.
-5. **Judge it**, using the rules below.
-
-**Rules of thumb:**
-- Within ±10% is a match.
-- A consistent 5–10% shortfall is expected (distortions 3 and 4).
-- A miss above 20% with plenty of trades (n ≥ 10) is a real problem. The usual cause is a
-  wrong payment direction (distortion 1): check whether the alternative reading matches.
-- A miss on n < 5 is not evidence of anything.
+Add a row to `published_levels.csv`: date (the trading day the level refers to, not the
+publication date), ticker, spread in bp, source, URL, a note (e.g. "intraday", "as low as"), and
+`role`: `design` if it was looked at while changing the method, `holdout` if it was found only
+afterwards. Only holdout levels (and levels read from headlines) count towards the accuracy
+figure on the dashboard. Prefer sources that name a vendor and a date; leave out intraday highs
+unless noted, and figures you can't date.
 
 ## Where to find cross-references
 
 - **X/Twitter.** These accounts regularly post CDS levels, usually from Bloomberg screens or
-  ICE data:
-  - [@KobeissiLetter](https://x.com/KobeissiLetter)
-  - [@GlobalMktObserv](https://x.com/GlobalMktObserv) (Global Markets Investor)
-  - [@HedgieMarkets](https://x.com/HedgieMarkets)
-  - [@TheShortBear](https://x.com/TheShortBear)
-
-  Search X for `"<company> CDS" basis points` or `"<ticker>" "credit default swap"`.
-- **News quoting vendor data:**
-  - CNBC (S&P Global Market Intelligence / LSEG data)
-  - Reuters (S&P/LSEG)
-  - Bloomberg (its own CBGN/ICE data; often paywalled, so look for relays: Longbridge,
-    36Kr, BigGo Finance, KuCoin News, Yahoo Finance)
-  - Barron's
-  - ROIC.ai and GuruFocus news snippets
-- **Substack:** search `site:substack.com "<company>" CDS`. One useful example is
-  markmancapitalinsight.substack.com (Nvidia). Substacks often post the Bloomberg chart itself,
-  which gives a whole history rather than one point.
-- **Rating-agency and bank research** (Morgan Stanley, S&P) quoted in the press, e.g. Morgan
-  Stanley's Nvidia credit initiation (Aug 2026) quoted 84/89bp bid/offer.
+  ICE data: [@KobeissiLetter](https://x.com/KobeissiLetter),
+  [@GlobalMktObserv](https://x.com/GlobalMktObserv), [@HedgieMarkets](https://x.com/HedgieMarkets),
+  [@TheShortBear](https://x.com/TheShortBear). Use `cds_check.py --tweet` to date a post.
+- **News quoting vendor data:** CNBC (S&P Global Market Intelligence / LSEG), Reuters,
+  Bloomberg (often paywalled; look for relays such as Longbridge, 36Kr, BigGo Finance, KuCoin
+  News, Yahoo Finance), Barron's, IFR, ROIC.ai.
+- **Substack:** `site:substack.com "<company>" CDS`; substacks often post the Bloomberg chart.
 - **Searches that worked:** `"<Company> 5-year CDS spread basis points Bloomberg"`,
   `"<Company> credit default swaps record basis points <year>"`.
 
-Prefer sources that name a vendor and a date. Treat "record"/"highest ever" posts as snapshots
-of a peak (distortion 3), and expect vendors to differ by 5–10% on the same day.
+Vendors differ by 5–10% on the same day, and posts cluster on record days.
 
-## Likely causes of distortion, most to least important
+## How the estimate is built, and what can make it wrong
 
-1. **Unknown payment direction (can be badly wrong).** DTCC reports the up-front payment's size
-   but never its sign: zero negatives in 73,696 standard-coupon trades checked. The buyer pays
-   when the spread is above the contract's fixed coupon (1% for investment grade, 5% for high
-   yield); below it, the seller pays. Reading it the wrong way turns 40bp into about 160bp. The
-   code takes the direction from the nearest quoted-spread trade, unless the up-front passed near
-   zero in between (a possible crossing of the coupon). With no usable quote it assumes the buyer
-   pays: hollow dots on the chart, `*` in the table, and the "assumed" count in `cds_check.py`.
-   - **Most exposed:** names trading near their coupon, i.e. Nvidia and Oracle up to late 2025
-     versus 100bp, and CoreWeave in Oct 2025 and Apr–Jun 2026 versus 500bp.
-   - **CoreWeave since Nov 2025** depends entirely on the assumption (no usable quotes). External
-     checks in Jul and Oct 2026 agree with it.
-2. **Thin data.** Only standard-coupon trades with 4–6 years left count, and only if they have a
-   quoted spread or an exact size. About 60% are reported as "$5,000,000+" and are unusable
-   without a spread.
-   - NVDA CDS only began trading in Nov 2025 and is sparse until Jun 2026.
-   - A handful of trades can set a month's median. Check `n` before trusting a miss.
-3. **Peak selection in the sources.** People post on record days, often intraday highs (e.g.
-   CoreWeave's 1,194.5bp intraday versus about 1,040bp at the close the same day). My figures are
-   medians of trades over several days, so they sit below headline numbers when spreads are
-   rising fast.
-4. **Trades versus quotes.** Mine are executed trade prices. Bloomberg/ICE levels are composite
-   end-of-day or intraday quotes. On fast days quotes lead trades, and trades fill at bid or offer.
-5. **Model simplifications:**
-   - Flat hazard over each contract's life, 40% recovery, flat 3.75% discount rate, monthly grid.
-   - Contracts of 4–6 years are treated as 5-year. Most trade out to Dec 2031 (about 5.2 years),
-     which slightly overstates the spread when the curve slopes upward.
-   - The reported up-front is assumed to include accrued coupon since the last IMM date (20th of
-     Mar/Jun/Sep/Dec). This is inferred, not documented; an error shifts every point by up to
-     about 0.25%/yr of coupon.
-   - "Spread ≈ hazard × 0.6" is an approximation; vendors convert with the ISDA standard model.
-     The difference is small (a few percent).
-6. **Probabilities are risk-neutral.** They include a premium for bearing default risk, so real
-   odds are lower. This doesn't affect the comparison (sources use the same convention) but
-   matters when reading the numbers.
-7. **What counts as default.** Contracts pay on bankruptcy or failure to pay by the parent entity,
-   not restructuring and not defaults inside financing subsidiaries (e.g. CoreWeave's DDTL SPVs).
-   Not a distortion, but explains gaps versus rating-agency default definitions.
+1. **Which trades.** US-dollar standard-coupon (1% or 5%) trades on the company's own credit,
+   matched by RED code (CRWV 239FAV, ORCL 6EC42L, NVDA 6D76CM) or reference-bond ISIN, with the
+   name as a fallback; another entity's RED code (e.g. ORACLE SYSTEMS CORP, 6EC42I) never matches.
+   Only fresh trades count (new trades with event TRAD, and corrections of them): novations,
+   modifications and terminations carry fees on existing trades. Legs of credit-index trades are
+   dropped: DTCC disseminates an index trade as one leg per company with the same payment, so a
+   payment repeated on 20+ lines of a day's file marks a leg (about 100 such Oracle "trades" were
+   being priced as Oracle's own credit, making most of its line from Nov 2024 to May 2025 the
+   investment-grade index). Only contracts with 4.5–5.5 years left count (the 5-year point, not
+   the 4-year one).
+2. **Net cash, not up-front.** DTCC's payment is the net cash at settlement: the clean up-front
+   minus the accrued coupon the seller hands back (accrual runs actual/360 from the last coupon
+   date on or before trade date + 1; coupon dates are the 20th of Mar/Jun/Sep/Dec, moved to
+   Monday at weekends). Confirmed on trades that report both a spread and a payment: this reading
+   fits within about 2bp of notional, the opposite sign misses by about 33bp. The earlier code
+   had the sign wrong, which biased every up-front-priced trade low (the "consistent 5–10%
+   shortfall" the 2026-10-18 check put down to other causes).
+3. **Who paid (can be badly wrong, and is shown when unsettled).** DTCC never reports the sign of
+   the payment. The two readings can be far apart (CoreWeave since July: about 170bp versus
+   1,040bp). The rule, fixed before the out-of-sample check below:
+   - a reading that needs a negative default rate is impossible, which settles that trade;
+   - a quoted spread settles who paid around it;
+   - a coupon-date test: accrual restarts on each coupon date, so the right reading runs straight
+     through it and the wrong one jumps by about twice the accrued coupon. It compares the last
+     5 days before with the first 4 after, and decides only if one reading jumps at most 2/3 as
+     much as the other. A quote within 30 days that disagrees overrules it;
+   - evidence on both sides of a trade that agrees settles it; where it disagrees, the side flips
+     on the day the net cash came closest to zero; evidence on one side only counts within 30 days.
+   Trades still unsettled keep both readings; a month where most are unsettled is drawn as a band
+   between the two (Oracle Nov 2024–May 2025, Nvidia Jun 2026 at the 2026-10-20 run).
+   The coupon-date test is weakest when the market moves about as much as the accrued coupon over
+   the same few days (CoreWeave's Sep 2026 test decided by 51bp versus 86bp).
+4. **Bad prints.** A settled trade more than 3× above or below the median of at least three
+   others within 5 days is dropped. Spreads reported 100× too small (e.g. `0.000223` for 223bp)
+   are scaled up only when they match properly reported quotes within 10 days (±25%).
+5. **Thin data.** About 60% of trades are reported as "$5,000,000+" without a spread and can't
+   be used. Months with fewer than 3 trading days are drawn faded; NVDA CDS only began trading in
+   Nov 2025. The 90% interval comes from resampling whole trading days, because prints on one day
+   (and the pieces of a split block) are not independent; a split block counts once.
+6. **Trades versus quotes, and peaks.** These are executed trade prices; vendor levels are
+   composite quotes, often end-of-day or intraday highs on record days. Expect the estimate to lag
+   on fast days.
+7. **Model simplifications.** Flat hazard over each contract's life, 40% recovery (30% and 50%
+   are shown), flat 3.75% discount rate, monthly grid. Given the right up-front, this is within
+   about 0.35pp of the ISDA standard model from 40 to 1,500bp; moving the rate by 75bp shifts the
+   result by about 0.4pp.
+8. **Probabilities are risk-neutral** (they include a premium for bearing default risk, so real
+   odds are likely lower), and **what counts as default** is narrow: bankruptcy or failure to pay
+   by the company, including on debt it guarantees (e.g. CoreWeave guarantees its DDTL 3.0 loan);
+   not a restructuring or out-of-court exchange, and not a subsidiary's unguaranteed debt.
 
-## Known issues / to-do
+CoreWeave's 2026 "quotes" at 105–130bp are total-return-swap financing spreads on its loans and
+convertibles (blank coupon, loan identifiers); they are never priced.
 
-- **Spreads in odd units (guarded rescale, done 2026-10-19).** Some trades report spreads 100×
-  too small, e.g. `0.000223` (ORCL, Oct 2026). `cds_signal._rescaled_spread` multiplies values
-  below 0.001 by 100 only when the result falls within the range of properly reported quotes
-  within 10 days (±25%); otherwise the print is dropped. This adds ~17 ORCL, 3 CRWV and 2 NVDA
-  trades. Of the three documented examples, only ORCL's is confirmed: `0.000042` (NVDA, Mar 2026)
-  has no proper quote within 96 days, and `0.00045` (CRWV, 2025-10-24) none within 22 days, so
-  both stay out. Oracle also has recurring `0.000048`/`0.00005`/`0.000056` prints that the guard
-  rejects whenever Oracle trades far from 50bp, which suggests some of these are not simple unit
-  errors. Tests: `python3 -m unittest test_cds_signal` from `cds/`.
-- **Recovery sensitivity.** The dashboard now shows the latest month at 30% and 50% recovery next
-  to the 40% estimate (e.g. CRWV Oct 2026: 48.8% / 55.1% / 63.1%).
-- **Trade filter.** Rows are matched on `Underlying Asset Name` or `UPI Underlier Name` (many
-  Oracle and Nvidia trades name the entity only in the latter) instead of anywhere in the row, and
-  only USD trades are priced. The currency check sits in `resolve`, not `scan`, because some
-  error-cancellation (`EROR`) rows have a blank currency and must still cancel their trades.
+## Results of the 2026-10-20 check
 
-## Results of the 2026-10-18 check
+Gap = (dashboard − published) / published, using settled trades from 4 days before to 1 day after
+the date (15 days either side for the month-only April level).
 
-Spreads in bp. "Mine" is the median of trades in the days ending on the date (window in brackets).
+**Out of sample** (levels found after the rule in point 3 was fixed):
 
-| Date | Name | Published | Source | Mine | Gap |
-|---|---|---|---|---|---|
-| ~2025-10-06 | CRWV | 368 | relayed report | 362 (Oct 1–10, quote-anchored) | ✓ |
-| 2026-07-29 | CRWV | ~855 ("~50%") | Tech Times | 787, P₅ 48% (Jul 24–31) | −8% |
-| 2026-10-15 | CRWV | 1,038 close, 1,194.5 intraday ("60%+") | CNBC; ICE via Longbridge/36Kr | 984, P₅ 56% (Oct 13–16) | −5 to −18% |
-| 2025-11-02 | ORCL | 81 | @GlobalMktObserv | 75 (Oct 27–Nov 7) | ✓ |
-| 2025-12-11 | ORCL | 139 | ROIC.ai | 108 (Dec 8–12, n=8) | **−22%** |
-| early 2026 | ORCL | 144 | @GlobalMktObserv ("144 at start of year") | 144 (Jan 2–9) | ✓ |
-| 2026-03-28 | ORCL | 191–198 | @KobeissiLetter, @GlobalMktObserv | 184 (Mar 23–31) | ✓ |
-| 2026-07-28/08-08 | ORCL | 210–215 | @TheShortBear, @GlobalMktObserv, @KobeissiLetter | 195 (Jul 20–Aug 5) | −8% |
-| 2026-09-26 | ORCL | 230 | @HedgieMarkets | 210 (Sep 22–30) | −9% |
-| 2026-10-14/15 | ORCL | 263–288 | @GlobalMktObserv; Reuters via Securitas; CNBC 282 | 279 (Oct 13–16) | ✓ |
-| 2026-06-01 | NVDA | ~38 | @KobeissiLetter | 26 (Jun 1–10, n=3) | **−30%** (thin) |
-| late Jun 2026 | NVDA | ~42 | Crypto Briefing (ICE) | 44 (Jun 20–30, n=1) | ✓ |
-| 2026-07-29 | NVDA | ~82 | @GlobalMktObserv; ICE | 75 (Jul 24–31) | −9% |
-| Aug 2026 | NVDA | 80–89 | @GlobalMktObserv 79.8; Morgan Stanley 84/89 | 78 (Aug 18–31) | −7 to −12% |
-| early Oct 2026 | NVDA | 80–87 | press summaries | 83 (Oct 1–16) | ✓ |
+| Date | Name | Published | Dashboard | Gap |
+|---|---|---|---|---|
+| 2026-04 | ORCL | 198 (Spinel Capital, month only) | 181 | −8.5% |
+| 2026-07-15 | NVDA | 57 (Crypto Briefing) | 55 | −4.0% |
+| 2026-07-20 | ORCL | 203 (Bloomberg) | 199 | −2.2% |
+| 2026-07-24 | ORCL | 203 (KuCoin) | 206 | +1.7% |
+| 2026-07-27 | ORCL | 198 (goldesel.de) | 210 | +6.2% |
+| 2026-07-31 | ORCL | 219 (goldesel.de) | 203 | −7.4% |
+| 2026-10-08 | CRWV | ~818 (derived from CNBC) | 851 | +4.1% |
+| 2026-10-16 | CRWV | ~1,104 (derived from CNBC) | 1,040 | −5.8% |
+| 2026-08-11 | NVDA | 72.11 (Crypto Briefing) | no usable trades | |
 
-**Verdict:** 15 of 19 within about 10%, with a mild low bias explained by distortions 3–4. The two
->20% misses are on thin data, or (ORCL Dec 2025) during the crossing of Oracle's 1% coupon. The
-published levels also confirm the direction logic: Oracle near 50bp in mid-2025 and Nvidia near
-40bp in June 2026 rule out the buyer-pays reading, which gave about 150bp for both. CoreWeave at
-855bp and 1,000bp+ confirms the buyer-pays assumption for its unanchored months.
+Median gap about 5%, worst 8.5%. The first holdout set found a real bug: on 2026-08-11 the
+dashboard showed 357bp for Nvidia, from a modification record carrying a 13% fee and a single new
+trade paying 6.3% (five times its neighbours) whose only possible reading was forced. Fixed by
+pricing only fresh trades and dropping isolated bad prints (point 4); after that, no usable trades
+remain near that date. The second holdout set was checked only after that fix.
 
-**Source links from this check:**
-- [CNBC, Oct 15 2026](https://www.cnbc.com/2026/10/15/coreweave-credit-default-swaps-hit-distress-levels-as-investors-sour-on-ai-debt.html)
-- [Longbridge](https://longbridge.com/en/news/302048150)
-- [36Kr](https://eu.36kr.com/en/p/4028016585986439)
-- [Tech Times](https://www.techtimes.com/articles/322222/20260730/coreweave-cds-hits-50-default-odds-bond-market-calls-time-gpu-debt-spiral.htm)
-- [Securitas](https://www.securitasglobal.com/risk-perspectives/oracle-cds-record-288-basis-points-ai-debt/)
-- [ROIC.ai](https://www.roic.ai/news/oracles-5-year-cds-surges-to-139-bps-signaling-heightened-credit-risk-perception-amid-strong-fundamentals-12-11-2025)
-- [Crypto Briefing](https://cryptobriefing.com/nvidia-cds-spreads-surpass-google/)
-- [Markman Capital Insight](https://markmancapitalinsight.substack.com/p/nvidias-cds-recorded-its-largest)
-- X posts, by status ID (date with `--tweet`):
-  - 1985006488658604354
-  - 2038023871690100765
-  - 2038245292743463049
-  - 2061587962224325092
-  - 2082110078031634558
-  - 2082173351192047817
-  - 2082456663798227341
-  - 2083962534005010761
-  - 2086123017428512828
-  - 2087168157031039028
-  - 2103918659873779811
-  - 2110363371631468871
+**In sample** (looked at while the method was being changed, so not a fair test): 20 levels from
+Oct 2025 to Oct 2026, median gap 2.9%, worst 9.5% (NVDA 2026-10-08, one trade). Nvidia on
+2026-06-01 (~38bp) falls in an unresolved month whose two readings are 38bp and 175bp.
+
+**Sources:** see `published_levels.csv` for the URL of each level.

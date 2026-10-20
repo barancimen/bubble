@@ -10,15 +10,18 @@ python3 pd_history.py ORCL      # weekly 5y default probability, ASCII chart wit
 ```
 
 `cds_signal.py` is the CDS code behind the AI bubble dashboard (`../bubble_watch.py` imports it from here).
-It downloads new daily files into `dtcc_cache/` (`dtcc_missing.json` lists weekdays with no file) and works out which direction
-each up-front payment went: DTCC reports the amount but not who paid.
+It downloads new daily files into `dtcc_cache/` (`dtcc_missing.json` lists weekdays with no file), keeps only fresh trades on
+each company's own credit (index legs and lifecycle records are dropped), and works out who paid each up-front where the data
+allow it: DTCC reports the net cash but not who paid. Where the data don't say, both readings are shown.
+`published_levels.csv` lists 5-year levels reported in the press; the dashboard draws them next to the estimate.
 To check its numbers against published levels: `python3 cds_check.py ORCL 2026-10-15 [days]`, and `python3 cds_check.py --tweet <status id>`
-to date an X post (full procedure, sources and known distortions: `CDS_VALIDATION.md`).
+to date an X post (method, procedure, sources and results: `CDS_VALIDATION.md`). Tests: `python3 -m unittest test_cds_signal`.
 
 `common.py` loads each ticker's `trades.csv` through `cds_signal.py`, so `pd.py` and `pd_history.py` price trades exactly as the dashboard does. That covers both standard coupons (1% investment grade, e.g. ORCL; 5% high yield, e.g. CRWV) and which direction each up-front payment went.
 `crwv/trades_oct15-16.csv` is the original two-day CoreWeave file the result below was first computed from.
 
-The sections below are the original CoreWeave write-up (Oct 15–16 2026).
+The sections below are the original CoreWeave write-up (Oct 15–16 2026). They predate the 2026-10-20 fixes: DTCC's payment
+is net of accrued coupon (the accrued is added back, not subtracted), so these up-fronts and probabilities are somewhat low.
 
 ## Result
 
@@ -49,7 +52,7 @@ The default rate the market prices goes up the further out you look: it's fairly
 - The data is thin, so the year-by-year rates jump around. The cumulative figures are more reliable.
 - Trades reported only as "5,000,000+" are left out, because their exact size isn't given.
 - The 10/16 14:02 trades share one timestamp and may be a batch of paperwork trades rather than fresh market prices.
-- The reported up-front amounts appear to include 26 days of accrued coupon, which the script subtracts.
+- The reported payments are net cash: the clean up-front minus 26 days of accrued coupon, which the seller hands back. (This write-up subtracted the accrued instead of adding it back; see the note above.)
 
 ## How it works
 

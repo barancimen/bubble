@@ -15,3 +15,6 @@ cds/dtcc_missing.json
 # Editor swap files
 *.swp
 *.swo
+
+# Built by --cached runs; the live page is dashboard.html
+dashboard-preview.html

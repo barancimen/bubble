@@ -5,11 +5,13 @@ The page is re-read on every request, so the daily cron run shows up
 without a restart. Runs as the bubble-dashboard systemd service.
 """
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "dashboard.html")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+STALE_HOURS = 30  # the page is rebuilt daily; older than this means a run failed
 
 # The page has no scripts, images or forms, so the browser is told to refuse all of them.
 SECURITY_HEADERS = {
@@ -34,9 +36,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with open(PAGE, "rb") as f:
                 body = f.read()
+            age = (time.time() - os.path.getmtime(PAGE)) / 3600
         except FileNotFoundError:
             self.send_error(503, "Dashboard not generated yet")
             return
+        if age > STALE_HOURS:  # say so on the page itself, so nobody reads old numbers as today's
+            banner = (f'<p style="border:2px solid #b00020;padding:8px;font-weight:700">This page was '
+                      f'last rebuilt {age:.0f} hours ago: the daily update has failed, so these '
+                      f'numbers may be out of date.</p>').encode()
+            body = body.replace(b"<body>", b"<body>" + banner, 1)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

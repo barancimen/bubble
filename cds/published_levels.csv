@@ -1,0 +1,23 @@
+date,ticker,spread_bp,source,url,note,role
+2025-12-05,CRWV,643,parameter.io,https://parameter.io/coreweave-crwv-stock-ai-cloud-provider-falls-as-2-billion-debt-offering-sparks-investor-concerns/,,design
+2026-06-05,CRWV,452,The Next Web (Bloomberg),https://thenextweb.com/news/coreweave-credit-rebound-applied-digital-junk-bond-data-center,"""as low as 4.52 percentage points"" in early June",design
+2026-07-29,CRWV,855,Tech Times,https://www.techtimes.com/articles/322222/20260730/coreweave-cds-hits-50-default-odds-bond-market-calls-time-gpu-debt-spiral.htm,,design
+2026-08-24,CRWV,790,FactSet (via LinkedIn),https://www.linkedin.com/posts/sean-ryan-ai-infrastructure_one-interesting-data-point-in-our-factset-activity-7498011738236190720-j5ct,,design
+2026-09-24,CRWV,810.9,Oninvest,https://en.oninvest.com/article/protection-against-big-tech-defaults-has-become-2-5-times-more-expensive-are-ai-related-debts-no-longer-safe,,design
+2026-10-15,CRWV,1038,CNBC,https://www.cnbc.com/2026/10/15/coreweave-credit-default-swaps-hit-distress-levels-as-investors-sour-on-ai-debt.html,close; intraday high 1194.5 (ICE),design
+2026-10-19,CRWV,1082,CNBC,https://www.cnbc.com/2026/10/19/coreweave-oracle-ai-credit-stress.html,"""nearly 2% lower than Friday""",holdout
+2025-12-11,ORCL,139,ROIC.ai,https://www.roic.ai/news/oracles-5-year-cds-surges-to-139-bps-signaling-heightened-credit-risk-perception-amid-strong-fundamentals-12-11-2025,,design
+2026-01-02,ORCL,144,Bloomberg (via KuCoin),https://www.kucoin.com/news/flash/oracle-s-5-year-cds-hits-record-high-sparking-investor-concern,"""144 basis points at the start of the year""",design
+2026-07-20,ORCL,203,Bloomberg (via KuCoin),https://www.kucoin.com/news/flash/oracle-s-5-year-cds-hits-record-high-sparking-investor-concern,2.03 percentage points,holdout
+2026-07-24,ORCL,203,KuCoin,https://www.kucoin.com/news/flash/oracle-s-5-year-cds-hits-record-high-sparking-investor-concern,,holdout
+2026-07-27,ORCL,198,goldesel.de,https://goldesel.de/aktien/news/oracle-aktie-unter-druck-cds-auf-219-bps-unklare-ki-ausgaben-mogliche-neue-entlassungen,"""the Monday before""",holdout
+2026-07-31,ORCL,219,goldesel.de,https://goldesel.de/aktien/news/oracle-aktie-unter-druck-cds-auf-219-bps-unklare-ki-ausgaben-mogliche-neue-entlassungen,end of July,holdout
+2026-09-24,ORCL,214.7,Oninvest,https://en.oninvest.com/article/protection-against-big-tech-defaults-has-become-2-5-times-more-expensive-are-ai-related-debts-no-longer-safe,,design
+2026-10-08,ORCL,257,IFR,https://www.ifre.com/people-and-markets/2496665/hyperscaler-and-chipmaker-cds-widen-to-record-levels,,design
+2026-10-15,ORCL,282,CNBC,https://www.cnbc.com/2026/10/15/coreweave-credit-default-swaps-hit-distress-levels-as-investors-sour-on-ai-debt.html,,design
+2026-10-15,ORCL,288,Reuters (via The Economic Times),https://economictimes.indiatimes.com/tech/artificial-intelligence/ai-credit-default-swap-spreads-widen-sharply/articleshow/134958105.cms,,design
+2026-06-25,NVDA,42,Crypto Briefing (ICE),https://cryptobriefing.com/nvidia-cds-spreads-surpass-google/,late June,design
+2026-07-15,NVDA,57,Crypto Briefing,https://cryptobriefing.com/nvidia-cds-spreads-surpass-google/,mid-July,holdout
+2026-07-27,NVDA,82,ICE (via TMGM),https://www.tmgm.com/en/analysis/market-insight/nvidia-cds-record-high,record high,design
+2026-08-11,NVDA,72.11,Crypto Briefing,https://cryptobriefing.com/nvidia-credit-risk-spikes-as-cds-spreads-near-record-levels/,single source,holdout
+2026-09-28,NVDA,87,IFR,https://www.ifre.com/people-and-markets/2496665/hyperscaler-and-chipmaker-cds-widen-to-record-levels,record high,design
