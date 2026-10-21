@@ -8,6 +8,8 @@ from unittest import mock
 
 import bubble_watch as b
 
+b.LAST_GOOD = tempfile.mkdtemp()  # saved copies from tests stay out of data/
+
 TEXT = ("WINDSOR, Conn., June 11, 2026 — Total U.S. annuity sales were $107.4 billion in the first "
         "quarter of 2026, a 1% increase from the same period in 2025, according to results from "
         "LIMRA's U.S. Individual Annuity Sales Survey. Fixed indexed annuity (FIA) sales slipped 4% "
@@ -123,11 +125,24 @@ class Spreads(unittest.TestCase):
     def test_threshold_is_exact(self):
         csv_text = "observation_date,BAMLC0A4CBBB\n" + "\n".join(
             f"{date(2025, 1, 1) + timedelta(days=i)},{'1.15' if i >= 500 else '0.85'}" for i in range(520))
-        with mock.patch.object(b, "fetch", return_value=csv_text.encode()):
+        with mock.patch.object(b, "_download", return_value=csv_text.encode()):
             rows = b.fred_series("BAMLC0A4CBBB")
         self.assertEqual(rows[-1][1] - min(v for _, v in rows[-366:]), 30)
         first, episodes = b.spread_episodes(rows, 30)
         self.assertEqual(len(episodes), 1)
+
+    def test_one_series_down_is_checked_by_hand(self):
+        csv_text = "observation_date,BAMLC0A4CBBB\n" + "\n".join(
+            f"{date(2025, 1, 1) + timedelta(days=i)},0.85" for i in range(520))
+        def download(url, ua, tries):
+            if url.endswith("BAMLC0A4CBBB"):
+                return csv_text.encode()
+            return b"<!doctype html><title>Site Maintenance | St. Louis Fed</title>"
+        with mock.patch.object(b, "_download", side_effect=download):
+            page = b.block_spreads()
+        self.assertIn("Check by hand", page)
+        self.assertIn("Site Maintenance", page)
+        self.assertIn("unavailable today", page)
 
 
 class WeakBorrowers(unittest.TestCase):
@@ -230,6 +245,107 @@ class Stores(unittest.TestCase):
             self.assertEqual(b.load_json_store(path), {})
             self.assertTrue(any(n.startswith("x.json.corrupt-") for n in os.listdir(tmp)))
             self.assertTrue(b.WARNINGS)
+
+
+def quarters(n=8, start=date(2024, 4, 1), val=lambda i: 10e9 + i * 1e9):
+    """Synthetic three-month XBRL flow facts for n consecutive calendar quarters."""
+    out, s = [], start
+    for i in range(n):
+        after = date(s.year + (s.month + 2) // 12, (s.month + 2) % 12 + 1, 1)  # first day after the quarter
+        e = after - timedelta(days=1)
+        out.append({"start": s.isoformat(), "end": e.isoformat(), "val": val(i), "filed": "2026-08-01"})
+        s = e + timedelta(days=1)
+    return out
+
+
+class OneSourceDown(unittest.TestCase):
+    """One company, ticker or series that can't be read leaves the others, and no verdict says No warning."""
+
+    def test_hyperscalers(self):
+        def concept(cik, name):
+            if cik == 1652044:
+                raise RuntimeError("SEC 503")
+            return quarters(val=(lambda i: 30e9 + i * 1e9) if name.startswith("NetCash") else (lambda i: 10e9 + i * 1e9))
+        with mock.patch.object(b, "sec_concept", side_effect=concept), \
+                mock.patch.object(b, "sec_concept_or_empty", return_value=[]), \
+                mock.patch.object(b, "oracle_prepayments", return_value={}), mock.patch.object(b, "TODAY", date(2026, 5, 1)):
+            page = b.block_hyperscalers()
+        self.assertIn("unavailable today: SEC 503", page)
+        self.assertIn("<h5>MSFT</h5>", page)
+        self.assertEqual(page.count("Check by hand"), 2)
+        self.assertNotIn("No warning", page)
+
+    def test_weak_borrowers(self):
+        def closes(ticker, span="1y"):
+            if ticker == "IREN":
+                raise RuntimeError("Yahoo timeout")
+            return [(str(date(2026, 1, 1) + timedelta(days=i)), 100.0) for i in range(80)]
+        with mock.patch.object(b, "yahoo_closes", side_effect=closes):
+            page = b.block_weak_borrowers()
+        self.assertIn("Check by hand", page)
+        self.assertIn("Yahoo timeout", page)
+        self.assertIn("<td>CRWV</td>", page)
+
+    def test_gpu_prices(self):
+        weeks = [((b.GPU_START + timedelta(weeks=i)).isoformat(), 2.0, 10) for i in range(30)]
+        def gpu(slug):
+            if slug == "nvidia-b200":
+                raise RuntimeError("no on-demand rows for nvidia-b200")
+            return weeks
+        with mock.patch.object(b, "gpu_weekly", side_effect=gpu):
+            page = b.block_gpu_prices()
+        self.assertIn("Check by hand", page)
+        self.assertIn("H100", page)
+
+    def test_every_source_down_fails_the_signal(self):
+        with mock.patch.object(b, "yahoo_closes", side_effect=RuntimeError("down")):
+            with self.assertRaises(RuntimeError):
+                b.block_weak_borrowers()
+
+    def test_web_page_instead_of_json(self):
+        with mock.patch.object(b, "_download", return_value=b"<html><title>Site Maintenance</title></html>"):
+            with self.assertRaisesRegex(RuntimeError, "data.sec.gov sent a web page instead of data .Site Maintenance."):
+                b.sec_concept(1, "X")
+
+
+class LastGood(unittest.TestCase):
+    URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLH0A0HYM2"
+    GOOD = b"observation_date,BAMLH0A0HYM2\n2026-10-19,2.80\n2026-10-20,2.85\n"
+
+    def test_saved_copy_is_used_and_said_so(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(b, "LAST_GOOD", tmp), \
+                mock.patch.object(b, "FALLBACKS", []), mock.patch.object(b, "CACHED", False):
+            with mock.patch.object(b, "_download", return_value=self.GOOD):
+                b.fred_series("BAMLH0A0HYM2")
+            with mock.patch.object(b, "_download", return_value=b"<title>Site Maintenance</title>"):
+                rows = b.fred_series("BAMLH0A0HYM2")
+            self.assertEqual(rows[-1], ("2026-10-20", 285.0))
+            self.assertEqual(len(b.FALLBACKS), 1)
+            self.assertIn("fred.stlouisfed.org (BAMLH0A0HYM2)", b.FALLBACKS[0])
+            self.assertIn("uses the copy saved", b.FALLBACKS[0])
+
+    def test_bad_response_never_replaces_the_saved_copy(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(b, "LAST_GOOD", tmp), \
+                mock.patch.object(b, "FALLBACKS", []), mock.patch.object(b, "CACHED", False):
+            with mock.patch.object(b, "_download", return_value=b"<title>Site Maintenance</title>"):
+                with self.assertRaises(RuntimeError):  # nothing saved yet
+                    b.fred_series("BAMLH0A0HYM2")
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_not_found_is_an_answer(self):
+        err = b.urllib.error.HTTPError(self.URL, 404, "Not Found", {}, None)
+        with mock.patch.object(b, "_download", side_effect=err), mock.patch.object(b, "CACHED", False):
+            self.assertEqual(b.sec_concept_or_empty(1, "X"), [])
+
+    def test_stale_ticker_is_not_averaged(self):
+        def closes(ticker, span="1y"):
+            n = 79 if ticker == "IREN" else 80  # IREN from an older saved copy
+            return [(str(date(2026, 1, 1) + timedelta(days=i)), 100.0 if i < 60 else 70.0) for i in range(n)]
+        page = None
+        with mock.patch.object(b, "yahoo_closes", side_effect=closes):
+            page = b.block_weak_borrowers()
+        self.assertIn("close of 2026-03-20", page)
+        self.assertIn("Check by hand", page)
 
 
 if __name__ == "__main__":

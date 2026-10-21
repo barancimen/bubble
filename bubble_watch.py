@@ -93,6 +93,7 @@ STORE_DAYS = 90           # forget headlines not seen for this long
 
 CACHED = "--cached" in sys.argv[1:]
 HTTP_CACHE = os.path.join(HERE, "data", "http_cache")
+LAST_GOOD = os.path.join(HERE, "data", "last_good")  # the newest response that passed its checks, per URL
 FETCHED_AT = os.path.join(HTTP_CACHE, "fetched_at")
 
 
@@ -112,6 +113,7 @@ def _run_clock():
 
 TODAY, NOW = _run_clock()
 WARNINGS = []  # problems worth a reader's attention, shown at the top of the page and logged
+FALLBACKS = []  # notes on saved copies used in place of failed downloads, also shown in their section
 
 
 def warn(text):
@@ -158,7 +160,8 @@ def _cache_path(url):
     return os.path.join(HTTP_CACHE, hashlib.sha256(url.encode()).hexdigest())
 
 
-def fetch(url, ua=WEB_UA, tries=3):
+def _download(url, ua, tries):
+    """The response from the network (saved for --cached runs), or in a --cached run the saved one."""
     if CACHED:
         try:
             with open(_cache_path(url), "rb") as f:
@@ -171,7 +174,11 @@ def fetch(url, ua=WEB_UA, tries=3):
             with urllib.request.urlopen(req, timeout=60) as r:
                 body = r.read()
             break
-        except OSError:  # covers URLError, HTTPError and timeouts
+        except urllib.error.HTTPError as e:
+            if e.code == 404 or attempt == tries - 1:
+                raise
+            time.sleep(5)
+        except OSError:  # covers URLError and timeouts
             if attempt == tries - 1:
                 raise
             time.sleep(5)
@@ -183,14 +190,86 @@ def fetch(url, ua=WEB_UA, tries=3):
     return body
 
 
-def fetch_json(url, ua=WEB_UA):
-    return json.loads(fetch(url, ua))
+def describe(url):
+    """A short name for where a response comes from, e.g. "fred.stlouisfed.org (BAMLH0A0HYM2)"."""
+    u = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qs(u.query)
+    what = (q["id"][0] if "id" in q else "a news search" if "q" in q
+            else "/".join(u.path.rstrip("/").split("/")[-3 if u.hostname == "data.sec.gov" else -1:]))
+    return f"{u.hostname} ({what})"
+
+
+def fetch(url, ua=WEB_UA, tries=3, check=None):
+    """The response body. check(url, body) raises if the body isn't the data asked for (such as a
+    maintenance page sent with status 200). A response that passes is kept in LAST_GOOD; when a
+    download fails or doesn't pass, that copy is used instead and the page says so, with the time
+    it was saved. A 404 is an answer (e.g. a concept a company doesn't report), so it is raised."""
+    try:
+        body = _download(url, ua, tries)
+        if check:
+            check(url, body)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise
+        problem = e
+    except Exception as e:
+        problem = e
+    else:
+        if not CACHED:
+            os.makedirs(LAST_GOOD, exist_ok=True)
+            path = os.path.join(LAST_GOOD, os.path.basename(_cache_path(url)))
+            for suffix, data in (("", body), (".json", json.dumps(dict(url=url, saved=f"{NOW:%Y-%m-%d %H:%M}")).encode())):
+                with open(path + suffix + ".tmp", "wb") as f:
+                    f.write(data)
+                os.replace(path + suffix + ".tmp", path + suffix)
+        return body
+    path = os.path.join(LAST_GOOD, os.path.basename(_cache_path(url)))
+    try:
+        with open(path, "rb") as f:
+            saved_body = f.read()
+        with open(path + ".json") as f:
+            saved = json.load(f)["saved"]
+    except (OSError, ValueError, KeyError):
+        raise problem from None
+    note = (f"{describe(url)}: today's download failed ({short_error(problem)}), so this uses the copy "
+            f"saved {saved} UTC.")
+    FALLBACKS.append(note)
+    warn(note)
+    return saved_body
+
+
+def not_data(url, body):
+    """The error for a response that isn't the data asked for, such as a maintenance page sent with
+    status 200: names the site and the page's title."""
+    title = re.search(rb"<title>(.*?)</title>", body[:5000], re.S | re.I)
+    title = " ".join(title.group(1).decode("utf-8", "replace").split()).strip("<> ") if title else ""
+    return RuntimeError(f"{urllib.parse.urlsplit(url).hostname} sent a web page instead of data"
+                        + (f" ({title})" if title else ""))
+
+
+def fetch_json(url, ua=WEB_UA, valid=None):
+    """Parsed JSON; valid(data) says whether it holds what was asked for."""
+    def check(url, body):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            raise not_data(url, body) from None
+        if valid and not valid(data):
+            raise RuntimeError(f"{urllib.parse.urlsplit(url).hostname} sent no usable data")
+    return json.loads(fetch(url, ua, check=check))
+
+
+def xml_check(url, body):
+    try:
+        ET.fromstring(body)
+    except ET.ParseError:
+        raise not_data(url, body) from None
 
 
 def sec_concept(cik, concept):
     time.sleep(0.2)  # SEC allows at most 10 requests per second
     url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/us-gaap/{concept}.json"
-    return fetch_json(url, SEC_UA)["units"]["USD"]
+    return fetch_json(url, SEC_UA, valid=lambda d: "USD" in d.get("units", {}))["units"]["USD"]
 
 
 def latest_filed(facts, key):
@@ -241,17 +320,22 @@ def year_earlier(series, end):
 
 def fred_series(series_id):
     # FRED stalls on browser-like user agents but answers Python's default one.
-    text = fetch(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", ua=None).decode()
+    def check(url, body):  # e.g. a maintenance page served with status 200
+        if not body.startswith(f"observation_date,{series_id}\n".encode()):
+            raise not_data(url, body)
+    text = fetch(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", ua=None, check=check).decode()
     rows = []
     for r in csv.reader(text.splitlines()[1:]):
         if len(r) == 2 and r[1] not in ("", "."):
             rows.append((r[0], round(float(r[1]) * 100, 6)))  # percent -> basis points, without float dust
+    if not rows:
+        raise RuntimeError(f"FRED sent no values for {series_id}")
     return rows
 
 
 def yahoo_closes(ticker, span="1y"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={span}&interval=1d"
-    r = fetch_json(url)["chart"]["result"][0]
+    r = fetch_json(url, valid=lambda d: bool((d.get("chart") or {}).get("result")))["chart"]["result"][0]
     closes = r["indicators"]["quote"][0]["close"]
     out = [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), c)
            for t, c in zip(r["timestamp"], closes) if c is not None]
@@ -264,7 +348,10 @@ def yahoo_closes(ticker, span="1y"):
 def gpu_weekly(slug):
     """Weekly on-demand median $/GPU-hour (each provider counted once) as
     [(week start, price, providers)], oldest first, complete weeks only."""
-    text = fetch(f"https://getdeploying.com/dataset/gpu-prices/{slug}.csv").decode()
+    def check(url, body):
+        if b"billing_type" not in body.split(b"\n", 1)[0]:
+            raise not_data(url, body)
+    text = fetch(f"https://getdeploying.com/dataset/gpu-prices/{slug}.csv", check=check).decode("utf-8", "replace")
     today = TODAY
     weeks = []
     for r in csv.DictReader(text.splitlines()):
@@ -280,7 +367,7 @@ def gpu_weekly(slug):
 def news(query):
     url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(query)
            + "&hl=en-US&gl=US&ceid=US:en")
-    root = ET.fromstring(fetch(url))
+    root = ET.fromstring(fetch(url, check=xml_check))
     items = []
     for i in root.findall("./channel/item"):
         try:
@@ -338,7 +425,7 @@ def line(rule, crossed, detail=""):
         status = "Check by hand"
     else:
         status = '<span class="bad">WARNING</span>' if crossed else "No warning"
-    detail = f" {detail}" if detail else ""
+    detail = f" {detail.strip()}" if detail.strip() else ""
     return (f'<p class="line"><b>Start worrying when:</b> {rule}<br>'
             f"<b>Now:</b> {status}.{detail}</p>")
 
@@ -501,8 +588,11 @@ def sec_concept_or_empty(cik, concept):
         if e.code == 404:
             return []
         raise
-    except RuntimeError:  # a --cached run that never fetched it
-        return []
+    except RuntimeError:
+        if CACHED and not os.path.exists(_cache_path(
+                f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/us-gaap/{concept}.json")):
+            return []  # a --cached run that never fetched it
+        raise
 
 
 def stale(end, what, max_days=SEC_STALE_DAYS):
@@ -512,6 +602,30 @@ def stale(end, what, max_days=SEC_STALE_DAYS):
         warn(f"{what}: the newest filed figures are for {end}, {age} days ago")
         return f" The newest figures are for {end}, which is unusually old: check for a late filing or a renamed concept."
     return ""
+
+
+def per_item(items, name, fn):
+    """[(item, fn(item) or None, error or None)] in order, so one company, ticker or series that
+    can't be read leaves the others on the page. Each failure is listed at the top of the page;
+    if every item fails, the whole signal fails."""
+    out = []
+    for it in items:
+        try:
+            out.append((it, fn(it), None))
+        except Exception as e:
+            print(f"ERROR in {name(it)}: {e!r}", file=sys.stderr)
+            out.append((it, None, short_error(e)))
+    if all(err for *_, err in out):
+        raise RuntimeError("; ".join(f"{name(it)}: {err}" for it, _, err in out))
+    for it, _, err in out:
+        if err:
+            warn(f"{name(it)}: unavailable today ({err})")
+    return out
+
+
+def unavailable(names):
+    """The detail sentence for a worry line that is missing some of its items."""
+    return f" No data today for {', '.join(names)}, so check by hand." if names else ""
 
 
 ORACLE_STORE = os.path.join(HERE, "data", "oracle_prepayments.json")
@@ -538,7 +652,7 @@ def oracle_prepayments():
         facts = []
         if inst:
             time.sleep(0.2)
-            root = ET.fromstring(fetch(base + inst, SEC_UA))
+            root = ET.fromstring(fetch(base + inst, SEC_UA, check=xml_check))
             ctx = {}
             for c in root.iter():
                 if c.tag.endswith("}context") and not any(x.tag.endswith("}segment") for x in c.iter()):
@@ -564,8 +678,8 @@ def oracle_prepayments():
 
 
 def block_hyperscalers():
-    rows, panels, fcf_negative, fcf_unknown, capex_down, unknown, notes = [], [], [], [], [], [], ""
-    for ticker, cik, capex_concept in HYPERSCALERS:
+    def company(item):
+        ticker, cik, capex_concept = item
         ocf = quarterly_flows(sec_concept(cik, "NetCashProvidedByUsedInOperatingActivities"))
         capex = quarterly_flows(sec_concept(cik, capex_concept))
         lease = quarterly_flows(sec_concept_or_empty(cik, "FinanceLeasePrincipalPayments"))
@@ -574,7 +688,7 @@ def block_hyperscalers():
         ends = [e for e in capex if e in ocf]
         fcf = {e: ocf[e] - capex[e] - lease.get(e, 0) - prepaid.get(e, 0) for e in ends}
         last = ends[-1]
-        notes += stale(last, f"{ticker} capex and cash flow")
+        notes = stale(last, f"{ticker} capex and cash flow")
         ttm = None
         if len(ends) < 4 or not consecutive(ends[-4:]):
             notes += f" {ticker}'s last four filed quarters ({', '.join(ends[-4:])}) aren't consecutive, so its four-quarter free cash flow isn't shown."
@@ -593,16 +707,7 @@ def block_hyperscalers():
         for e in ends[-2:]:
             prior = year_earlier(capex, e)
             yoys.append((capex[e] / prior - 1) * 100 if prior else None)
-        if None in yoys:
-            unknown.append(ticker)
-        elif all(y < 0 for y in yoys):
-            capex_down.append(ticker)
-        if ttm is None:
-            fcf_unknown.append(ticker)
-        elif ttm < 0:
-            fcf_negative.append(ticker)
         last6 = ends[-6:]
-        panels.append((ticker, last6, [capex[e] / 1e9 for e in last6], [fcf[e] / 1e9 for e in last6]))
         if prepaid:
             notes += (f" For Oracle, customer prepayments with a significant financing component "
                       f"(${sum(prepaid.get(e, 0) for e in ends[-4:]) / 1e9:,.1f}B over the last four quarters) are "
@@ -612,7 +717,27 @@ def block_hyperscalers():
                 if v and e in last6 and days_between(s, e) > 100:
                     notes += (f" Oracle tagged these prepayments for {s} to {e} only as a total "
                               f"(${v / 1e9:,.1f}B); the chart shows all of it in the quarter ending {e}.")
-        rows.append([ticker, esc(last), billions(ttm, True) if ttm is not None else "n/a",
+        return dict(last=last, ttm=ttm, yoys=yoys, notes=notes,
+                    panel=(ticker, last6, [capex[e] / 1e9 for e in last6], [fcf[e] / 1e9 for e in last6]))
+
+    rows, panels, fcf_negative, fcf_unknown, capex_down, unknown, missing, notes = [], [], [], [], [], [], [], ""
+    for (ticker, *_), r, err in per_item(HYPERSCALERS, lambda it: f"{it[0]} capex and cash flow", company):
+        if err:
+            missing.append(ticker)
+            rows.append([ticker, f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a"])
+            continue
+        yoys, ttm = r["yoys"], r["ttm"]
+        notes += r["notes"]
+        if None in yoys:
+            unknown.append(ticker)
+        elif all(y < 0 for y in yoys):
+            capex_down.append(ticker)
+        if ttm is None:
+            fcf_unknown.append(ticker)
+        elif ttm < 0:
+            fcf_negative.append(ticker)
+        panels.append(r["panel"])
+        rows.append([ticker, esc(r["last"]), billions(ttm, True) if ttm is not None else "n/a",
                      " / ".join(pct(y, True) for y in yoys)])
     lo = min(0, *(min(f) for *_, f in panels))
     hi = max(0, *(max(c) for _, _, c, _ in panels))
@@ -629,6 +754,7 @@ def block_hyperscalers():
     detail = f"Two quarters below a year earlier: {', '.join(capex_down)}." if capex_down else ""
     if unknown:
         detail += f" No year-earlier figure for {', '.join(unknown)}, so check by hand."
+    detail += unavailable(missing)
     out += line(
         "any company's quarterly capex is lower than in the same quarter a year earlier, two "
         "quarters in a row (one lumpy quarter isn't enough). Ares's trigger is a season of "
@@ -636,16 +762,17 @@ def block_hyperscalers():
         "on an earnings call comes months before it shows up here, so read the calls: Microsoft, "
         "Alphabet, Amazon and Meta report in late January or early February, late April, late July "
         "and late October; Oracle in mid-March, mid-June, mid-September and mid-December.",
-        True if capex_down else (None if unknown else False), detail)
+        True if capex_down else (None if unknown or missing else False), detail)
     out += line(
         "free cash flow over the last four quarters is below zero: over a full year, capex and "
         "lease repayments took more than the cash the business generated. Single quarters swing "
         "with working capital and the seasons (Amazon's first quarter is often negative), so they "
         "don't count on their own. Ares pointed to Alphabet and Amazon posting negative free cash "
         "flow in a recent quarter.",
-        True if fcf_negative else (None if fcf_unknown else False),
+        True if fcf_negative else (None if fcf_unknown or missing else False),
         (f"Negative over the last four quarters: {', '.join(fcf_negative)}." if fcf_negative else "")
-        + (f" No four-quarter figure for {', '.join(fcf_unknown)}, so check by hand." if fcf_unknown else ""))
+        + (f" No four-quarter figure for {', '.join(fcf_unknown)}, so check by hand." if fcf_unknown else "")
+        + unavailable(missing))
     out += ('<p class="muted">Free cash flow here = operating cash flow − purchases of property and '
             "equipment − principal repayments of finance leases (where reported), as filed; this is "
             "Meta's own definition. Amazon's headline figure nets proceeds from asset sales against "
@@ -675,9 +802,14 @@ def block_nvidia():
 
 
 def block_backlog():
-    rows, crossed, unknown, panels, dips, notes = [], [], [], [], [], ""
-    for ticker, cik in BACKLOG:
-        rpo = point_in_time(sec_concept(cik, "RevenueRemainingPerformanceObligation"))
+    rows, crossed, unknown, missing, panels, dips, notes = [], [], [], [], [], [], ""
+    fetched = per_item(BACKLOG, lambda it: f"{it[0]} backlog",
+                       lambda it: point_in_time(sec_concept(it[1], "RevenueRemainingPerformanceObligation")))
+    for (ticker, _), rpo, err in fetched:
+        if err or not rpo:
+            missing.append(ticker)
+            rows.append([ticker, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>', "n/a", "n/a"])
+            continue
         ends = list(rpo)
         q = [(rpo[e] / rpo[p] - 1) * 100 if consecutive([p, e]) else None  # None: a quarter is missing
              for p, e in zip(ends, ends[1:])]
@@ -708,18 +840,22 @@ def block_backlog():
         "or renegotiated. A single quarterly dip isn't enough: backlog is worked off as it is "
         "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
         "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
-        True if crossed else (None if unknown else False),
+        True if crossed else (None if unknown or missing else False),
         (f"Lower than a year earlier or down two quarters in a row: {', '.join(crossed)}." if crossed else "")
         + (f" A quarter is missing from {', '.join(unknown)}'s latest filed figures, so check by hand." if unknown else "")
-        + notes)
+        + unavailable(missing) + notes)
     return out + source("SEC EDGAR XBRL filings (remaining performance obligations)",
                         "https://www.sec.gov/edgar/search/")
 
 
 def block_commitments():
     rows = []
-    for ticker, cik, concept, what in COMMITMENTS:
-        series = point_in_time(sec_concept_or_empty(cik, concept))
+    fetched = per_item(COMMITMENTS, lambda it: f"{it[0]} commitments",
+                       lambda it: point_in_time(sec_concept_or_empty(it[1], it[2])))
+    for (ticker, _, _, what), series, err in fetched:
+        if err:
+            rows.append([ticker, esc(what), f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a"])
+            continue
         if not series:
             rows.append([ticker, esc(what), "not reported", "n/a", "n/a"])
             continue
@@ -744,9 +880,15 @@ def block_commitments():
 
 
 def block_gpu_prices():
-    rows, crossed, lines, worst_text = [], [], [], []
-    for i, (slug, name) in enumerate(GPU_MODELS):
-        weeks = [w for w in gpu_weekly(slug) if w[0] >= GPU_START.isoformat()]
+    rows, crossed, lines, worst_text, missing = [], [], [], [], []
+    fetched = per_item(GPU_MODELS, lambda it: f"{it[1]} rental prices",
+                       lambda it: [w for w in gpu_weekly(it[0]) if w[0] >= GPU_START.isoformat()])
+    for i, ((slug, name), weeks, err) in enumerate(fetched):
+        if err or len(weeks) < 2:
+            missing.append(name)
+            rows.append([name, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>',
+                         "n/a", "n/a", "n/a", "n/a", "n/a"])
+            continue
         lines.append((name, SERIES[i], [(w, p) for w, p, _ in weeks]))
         week, price, providers = weeks[-1]
         avg = lambda j: st.mean(p for _, p, _ in weeks[j - GPU_AVG_WEEKS + 1:j + 1])  # 4-week average ending at week j
@@ -784,7 +926,8 @@ def block_gpu_prices():
         "Falling rental prices mean the chips backing GPU loans are losing value faster than lenders "
         "assumed. (Ares's chart covers 2023–25, when H100 rentals fell from about $8.50 to $3.00; Ares "
         "ties the risk to new chip generations, which Nvidia now ships roughly every year.)",
-        bool(crossed), f"Down {GPU_DROP_13W_PCT}% or more over 13 weeks: {', '.join(crossed)}." if crossed else "")
+        True if crossed else (None if missing else False),
+        (f"Down {GPU_DROP_13W_PCT}% or more over 13 weeks: {', '.join(crossed)}." if crossed else "") + unavailable(missing))
     return out + (
         '<p class="muted">Source: <a href="https://getdeploying.com/dataset/gpu-prices">'
         "GetDeploying, GPU rental price history</a>, "
@@ -825,11 +968,16 @@ def describe_episodes(name, limit, first, episodes):
 
 
 def block_spreads():
-    out_rows, crossed, history = [], [], []
-    for series_id, name, short, limit in [("BAMLC0A4CBBB", "BBB corporate (lowest investment grade)",
-                                           "BBB spreads", BBB_WIDENING_BP),
-                                          ("BAMLH0A0HYM2", "High yield", "high-yield spreads", HY_WIDENING_BP)]:
-        rows = fred_series(series_id)
+    out_rows, crossed, history, missing = [], [], [], []
+    series = [("BAMLC0A4CBBB", "BBB corporate (lowest investment grade)", "BBB spreads", BBB_WIDENING_BP),
+              ("BAMLH0A0HYM2", "High yield", "high-yield spreads", HY_WIDENING_BP)]
+    for (series_id, name, short, limit), rows, err in per_item(series, lambda it: f"{it[1]} spread",
+                                                               lambda it: fred_series(it[0])):
+        if err:
+            missing.append(name)
+            out_rows.append([name, f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a",
+                             "n/a", f"+{limit}bp"])
+            continue
         history.append(describe_episodes(short, limit, *spread_episodes(rows, limit)))
         d, latest = rows[-1]
         if (TODAY - date.fromisoformat(d)).days > 6:
@@ -852,7 +1000,8 @@ def block_spreads():
         f"BBB spreads are {BBB_WIDENING_BP}bp or more above their 1-year low, or high-yield "
         f"spreads {HY_WIDENING_BP}bp or more. {' '.join(history)} "
         "These cover the whole market, not just AI debt, so they confirm stress more than predict it.",
-        bool(crossed), f"At or past the line: {', '.join(crossed)}." if crossed else "")
+        True if crossed else (None if missing else False),
+        (f"At or past the line: {', '.join(crossed)}." if crossed else "") + unavailable(missing))
     return out + source("ICE BofA option-adjusted spreads via FRED",
                         "https://fred.stlouisfed.org/series/BAMLC0A4CBBB")
 
@@ -1066,23 +1215,35 @@ def block_cds():
 
 
 def block_weak_borrowers():
-    rows, moves, last_day = [], {}, None
-    for ticker in WEAK_BORROWERS + ["QQQ"]:
-        series = yahoo_closes(ticker)
+    rows, row_of, moves, ends, missing = [], {}, {}, {}, []
+    for ticker, series, err in per_item(WEAK_BORROWERS + ["QQQ"], lambda t: f"{t} stock price", yahoo_closes):
+        label = "QQQ (Nasdaq-100, for comparison)" if ticker == "QQQ" else ticker
+        if err or not series:
+            missing.append(ticker)
+            rows.append([label, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>',
+                         "n/a", "n/a", "n/a"])
+            continue
         closes = [c for _, c in series]
-        last, last_day = closes[-1], series[-1][0]
+        last, ends[ticker] = closes[-1], series[-1][0]
         r1m = (last / closes[-22] - 1) * 100 if len(closes) > 22 else None
         r3m = (last / closes[-64] - 1) * 100 if len(closes) > 64 else None
         dd = (last / max(closes) - 1) * 100
         moves[ticker] = r1m
-        label = "QQQ (Nasdaq-100, for comparison)" if ticker == "QQQ" else ticker
         rows.append([label, f"{last:,.2f}", pct(r1m), pct(r3m), pct(dd)])
+        row_of[ticker] = rows[-1]
+    last_day = max(ends.values())
+    for ticker, row in row_of.items():
+        if ends[ticker] < last_day:  # from an older saved copy: its own date, and not compared with the rest
+            row[1] += f' <span class="error">(close of {esc(ends[ticker])})</span>'
+            moves[ticker] = None
     out = table(["Ticker", f"Close ({esc(last_day)})", "1 month", "3 months", "From 52-week high"], rows)
-    group = [t for t in WEAK_BORROWERS if t != "ORCL" and moves.get(t) is not None]
-    basket = st.mean(moves[t] for t in group) if group else None
-    fell = [t for t in group if moves[t] <= -WEAK_EACH_PCT]
+    group = [t for t in WEAK_BORROWERS if t != "ORCL"]
+    # Every one of the six and QQQ is needed: an average over fewer can't say the line wasn't reached.
+    lacking = [t for t in group + ["QQQ"] if moves.get(t) is None]
+    basket = None if lacking else st.mean(moves[t] for t in group)
+    fell = [t for t in group if moves.get(t) is not None and moves[t] <= -WEAK_EACH_PCT]
     qqq = moves.get("QQQ")
-    crossed = (None if basket is None or qqq is None
+    crossed = (None if lacking
                else basket <= -WEAK_BASKET_PCT and len(fell) >= 4 and qqq > -QQQ_CALM_PCT)
     out += line(
         f"the former bitcoin miners and CoreWeave fall together while the market holds up: over a "
@@ -1095,7 +1256,8 @@ def block_weak_borrowers():
         "credit event. A fall that comes with news of a pulled bond deal, a downgrade or a covenant "
         "problem (see the headlines below) matters more.",
         crossed, (f"Over the last month: the six {basket:+.1f}% on average, {len(fell)} down "
-                  f"{WEAK_EACH_PCT}% or more, QQQ {qqq:+.1f}%." if crossed is not None else ""))
+                  f"{WEAK_EACH_PCT}% or more, QQQ {qqq:+.1f}%." if crossed is not None
+                  else f"No one-month change today for {', '.join(lacking)}, so check by hand."))
     return out + source("Yahoo Finance daily closes", "https://finance.yahoo.com/")
 
 
@@ -1694,7 +1856,7 @@ def limra_quarters():
     store = load_json_store(LIMRA_STORE)
     problems = []
     first_year = TODAY.year - LIMRA_YEARS
-    xml = fetch(LIMRA_SITEMAP).decode("utf-8", "replace")
+    xml = fetch(LIMRA_SITEMAP, check=xml_check).decode("utf-8", "replace")
     for url in re.findall(r"<loc>([^<]+)</loc>", xml):
         low = url.lower()
         if "/newsroom/news-releases/" not in low or "annuit" not in low:
@@ -1816,7 +1978,12 @@ def block_annuities():
     out += line(rule, crossed, detail)
     for p in problems:
         out += f'<p class="error">{esc(p)}</p>'
-    news, _, news_detail = feed_block("F")
+    try:  # the news shouldn't take the LIMRA figures down with it
+        news, _, news_detail = feed_block("F")
+    except Exception as e:
+        print(f"ERROR in annuity sales news: {e!r}", file=sys.stderr)
+        warn("Annuity sales news: unavailable today")
+        news, news_detail = f'<p class="error">Annuity sales news unavailable today: {esc(short_error(e))}</p>', ""
     out += f"<h4>Annuity sales news</h4>{news}"
     if news_detail:
         out += f'<p class="muted">{news_detail}</p>'
@@ -1929,12 +2096,14 @@ def main():
         for title, fn in blocks:
             if title:
                 body.append(f"<h3>{esc(title)}</h3>")
+            seen = len(FALLBACKS)
             try:
                 body.append(fn())
             except Exception as e:  # one broken source shouldn't sink the page
                 print(f"ERROR in {title or heading}: {e!r}", file=sys.stderr)
                 warn(f"{title or heading}: could not be built today")
                 body.append(f'<p class="error">Could not fetch this signal today: {esc(short_error(e))}</p>')
+            body.extend(f'<p class="error">Saved data: {esc(n)}</p>' for n in FALLBACKS[seen:])
     body.append("<h2>Not on this dashboard</h2>")
     body.append(f"<p>{esc(NOT_HERE)}</p></body></html>")
     head = [
