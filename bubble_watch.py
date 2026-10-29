@@ -60,7 +60,7 @@ HYPERSCALERS = [  # ticker, SEC CIK, XBRL concept the company uses for capex
     ("META", 1326801, "PaymentsToAcquirePropertyPlantAndEquipment"),
     ("ORCL", 1341439, "PaymentsToAcquirePropertyPlantAndEquipment"),
 ]
-BACKLOG = [("ORCL", 1341439), ("MSFT", 789019), ("GOOGL", 1652044)]
+BACKLOG = [("ORCL", 1341439), ("MSFT", 789019), ("GOOGL", 1652044), ("CRWV", 1769628)]
 NVDA_CIK = 1045810
 COMMITMENTS = [  # ticker, CIK, concept, what the company's filings say the tagged figure is
     ("GOOGL", 1652044, "LongTermPurchaseCommitmentAmount", "Purchase commitments, mostly long-term supply agreements"),
@@ -797,8 +797,57 @@ def block_nvidia():
                 None if gap else change < 0,
                 (f"The latest two filed quarters ({ends[-2]} and {ends[-1]}) aren't consecutive, so check by hand."
                  if gap else f"Latest quarter vs previous: {pct(change, True)}.") + stale(ends[-1], "Nvidia revenue"))
+    try:  # the receivables shouldn't take the revenue line down with them
+        ar, ar_err = point_in_time(sec_concept(NVDA_CIK, "AccountsReceivableNetCurrent")), None
+    except Exception as e:
+        print(f"ERROR in Nvidia receivables: {e!r}", file=sys.stderr)
+        ar, ar_err = {}, short_error(e)
+        warn(f"Nvidia receivables: unavailable today ({ar_err})")
+    out += receivables_line(rev, ar, ar_err)
     return out + source("SEC EDGAR XBRL filings (Nvidia)",
                         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
+
+
+DSO_LOOKBACK = 12  # quarters: a three-year high in days of sales owed
+
+
+def receivables_line(rev, ar, err=None):
+    """Worry line for Nvidia's days of sales outstanding: receivables at quarter end ÷ the
+    quarter's revenue × days in the quarter, against its high over the previous three years."""
+    allq = list(rev)
+    dso = {e: ar[e] / rev[e] * days_between(p, e) for p, e in zip(allq, allq[1:])
+           if e in ar and consecutive([p, e])}
+    ends = list(dso)
+
+    def at_high(i):  # None when the three years before aren't all there
+        before = ends[i - DSO_LOOKBACK:i]
+        if i < DSO_LOOKBACK or not consecutive(before + [ends[i]]):
+            return None
+        return dso[ends[i]] > max(dso[e] for e in before)
+
+    past = [f"{date.fromisoformat(e):%b %Y}" for i, e in enumerate(ends[:-1]) if at_high(i)]
+    rule = ("customers owe Nvidia more days of sales than at any quarter end in the previous three "
+            "years (receivables at quarter end ÷ the quarter's revenue × days in the quarter). Slower "
+            "payment can mean Nvidia is giving buyers longer terms to keep sales going, in effect "
+            "lending to them; it can also just mean shipments bunched at the end of the quarter, so "
+            "read the explanation in the 10-Q.")
+    first = next((e for i, e in enumerate(ends) if at_high(i) is not None), None)
+    if past:
+        rule += (f" Since {first[:4]} this happened at {', '.join(past)}; Nvidia's revenue fell "
+                 "from late 2018 and from mid-2022.")
+    last = allq[-1] if allq else None
+    if err or last not in dso:
+        why = f"unavailable today ({esc(err)})" if err else f"not filed for the quarter ending {last}"
+        return line(rule, None, f"Nvidia's receivables are {why}, so check by hand.")
+    i = len(ends) - 1
+    verdict = at_high(i)
+    if verdict is None:
+        return line(rule, None, "A quarter is missing from the three years of filed figures, so check by hand.")
+    before = ends[i - DSO_LOOKBACK:i]
+    high = max(before, key=dso.get)
+    return line(rule, verdict,
+                f"{dso[last]:.1f} days at {last}, {dso[ends[i - 1]]:.1f} the quarter before; the "
+                f"highest in the three years before was {dso[high]:.1f} ({high}).")
 
 
 def block_backlog():
@@ -834,10 +883,10 @@ def block_backlog():
                    + "</div>" for t, ends, v in panels) + "</div>"
     out += table(["Company", "Latest quarter end", "vs previous quarter", "vs a year earlier"], rows)
     out += line(
-        "backlog at any of the three is lower than a year earlier, or has fallen two quarters in "
+        "backlog at any of the four is lower than a year earlier, or has fallen two quarters in "
         "a row. Much of it is reported to be OpenAI and Anthropic compute commitments (e.g. OpenAI's "
         "reported $300B deal with Oracle), so a sustained fall can mean commitments are being cut "
-        "or renegotiated. A single quarterly dip isn't enough: backlog is worked off as it is "
+        "or renegotiated. CoreWeave's backlog also secures its GPU loans. A single quarterly dip isn't enough: backlog is worked off as it is "
         "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
         "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
         True if crossed else (None if unknown or missing else False),
@@ -1265,9 +1314,13 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
     ("A", "Hyperscalers pulling back",
      ['(Microsoft OR Google OR Amazon OR Meta OR Oracle OR OpenAI OR CoreWeave) "data center" '
       '(lease OR leases) (cancel OR canceled OR pause OR paused OR defer OR deferred OR '
-      '"force majeure" OR "walks away" OR "pulls back") when:30d'],
-     "a hyperscaler or AI lab cancelling, deferring, pausing or walking away from a data center "
-     "lease or site, or invoking a contract exit such as force majeure",
+      '"force majeure" OR "walks away" OR "pulls back") when:30d',
+      '(Microsoft OR Google OR Amazon OR Meta OR Oracle OR OpenAI OR CoreWeave) "data center" '
+      '(lease OR leases OR contract) (renegotiate OR renegotiated OR rephase OR rephasing OR '
+      '"scaled back") when:30d'],
+     "a hyperscaler or AI lab cancelling, deferring, pausing, renegotiating, rephasing, scaling "
+     "back or walking away from a data center lease or site, or invoking a contract exit such as "
+     "force majeure",
      "Ares's take-or-pay example shows these exits are written into the contracts."),
     ("B", "Capex guidance",
      ["(Microsoft OR Alphabet OR Amazon OR Meta OR Oracle) capex (cut OR cuts OR lower OR "
@@ -1278,10 +1331,11 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
      "That is the board-level shift Ares says would set off the guarantees, and it reaches the "
      "news months before the filings."),
     ("C", "OpenAI and Anthropic",
-     ['OpenAI (funding OR revenue OR "cash burn" OR commitment OR valuation) when:30d',
+     ['OpenAI (funding OR revenue OR "cash burn" OR commitment OR valuation OR IPO) when:30d',
       'Anthropic (funding OR revenue OR "cash burn" OR commitment OR valuation) when:30d'],
-     "OpenAI or Anthropic raising less, later or at a lower valuation than planned, missing "
-     "revenue targets, or cutting or renegotiating a compute commitment",
+     "OpenAI or Anthropic raising less, later or at a lower valuation than planned (including "
+     "postponing a planned IPO or pricing it below its last private valuation), missing revenue "
+     "targets, or cutting or renegotiating a compute commitment",
      "Much of the debt depends on them paying."),
     ("D", "Weak borrowers",
      ["CoreWeave (downgrade OR covenant OR refinancing OR default OR notes OR bond) when:30d",
@@ -1465,6 +1519,23 @@ def classify(sections):
     return new_stories, same, r.get("usage", {}).get("total_tokens", 0)
 
 
+def carried_over(known, fid, taken):
+    """Headlines an earlier run found for this feed, still inside its search window, that
+    today's searches didn't return: Google News sometimes serves an older result set for the
+    same search, which would otherwise drop recent (even flagged) stories from the page."""
+    oldest = NOW - timedelta(days=window_days(FEEDS[fid][2][0]))
+    bucket = []
+    for k, rec in known.items():
+        if rec.get("feed") != fid or "when" not in rec or k in taken:
+            continue
+        when = datetime.fromisoformat(rec["when"])
+        if when >= oldest:
+            taken.add(k)
+            bucket.append({"when": when, "title": rec["title"], "link": rec["link"], "key": k,
+                           "feed": fid, "carried": True})
+    return sorted(bucket, key=lambda h: h["when"], reverse=True)
+
+
 @functools.lru_cache(maxsize=None)
 def headlines():
     """Fetches every feed once, groups headlines about the same event into stories,
@@ -1496,6 +1567,10 @@ def headlines():
                         bucket.append(dict(h, key=k, feed=fid))
                 available[fid] += len(bucket)
                 buckets[fid].append(bucket)
+    for fid in FEEDS:  # after every search, so a headline another feed found today stays there
+        bucket = carried_over(known, fid, taken)
+        available[fid] += len(bucket)
+        buckets[fid].append(bucket)
     quotas = feed_quotas(available, MAX_HEADLINES)
     picked = [h for fid, bs in buckets.items() for b in cap_round_robin(bs, quotas[fid]) for h in b]
 
@@ -1512,7 +1587,9 @@ def headlines():
         for n, h in enumerate(items, 1):
             h.update(id=f"{fid}{n}", date=h["when"].date().isoformat())
             rec = known.setdefault(h["key"], {"first_seen": today})
-            rec["last_seen"] = today
+            if not h.get("carried"):
+                rec["last_seen"] = today
+            rec.update(feed=fid, title=h["title"], link=h["link"], when=h["when"].isoformat())
             if current(rec.get("story"), fid):
                 continue
             rec.pop("story", None)
@@ -1611,6 +1688,7 @@ def headlines():
                         "new": first_seen == today and today != store["created"] and fresh})
         out.sort(key=lambda g: g["latest"], reverse=True)
         feeds[fid] = {"stories": out, "error": "; ".join(errors[fid]) or None, "capped": fid in capped,
+                      "carried": sum(1 for h in items if h.get("carried")),
                       "available": available[fid]}
 
     cutoff = (TODAY - timedelta(days=STORE_DAYS)).isoformat()
@@ -1657,6 +1735,11 @@ def feed_block(fid):
     out = (f'<p class="muted">{n_headlines} headlines {span}, grouped into {len(items)} stories'
            + (f" (searches cover the last {window_days(FEEDS[fid][2][0])} days, but the cap on headlines "
               "dropped the oldest here)" if feed["capped"] else "") + ".</p>")
+    if feed.get("carried"):
+        n = feed["carried"]
+        verb = "wasn't" if n == 1 else "weren't"
+        out += (f'<p class="muted">{n} of these {verb} returned by today\'s search; they are kept from '
+                "earlier runs, because Google News sometimes returns an older set of results.</p>")
     if feed["error"]:
         out += f'<p class="error">Some searches failed today: {esc(feed["error"])}</p>'
     if flagged:
@@ -2026,8 +2109,8 @@ SECTIONS = [
     ]),
     ("2. Capex and income", [
         ("Hyperscaler capex and free cash flow", block_hyperscalers),
-        ("Nvidia revenue", block_nvidia),
-        ("Contract backlog at Oracle, Microsoft and Alphabet", block_backlog),
+        ("Nvidia revenue and receivables", block_nvidia),
+        ("Contract backlog at Oracle, Microsoft, Alphabet and CoreWeave", block_backlog),
         ("GPU rental prices", block_gpu_prices),
         ("Commitments not on the balance sheet", block_commitments),
     ]),
@@ -2116,7 +2199,8 @@ def main():
         "checks described there. Each signal shows a line where this dashboard suggests starting to worry; "
         "these lines are the dashboard's own, not Ares's, and there is no overall score. The signals follow "
         'Ares\'s Fall 2026 <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
-        'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a> newsletter.</p>',
+        'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a> newsletter and '
+        '<a href="https://www.groundbrkr.com/t/ai">Groundbreaker</a>.</p>',
     ]
     if WARNINGS:
         head.append('<div class="warnings"><b>Problems in this run:</b><ul>'

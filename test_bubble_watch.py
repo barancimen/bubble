@@ -191,10 +191,52 @@ class Quarterly(unittest.TestCase):
     def test_nvidia_with_a_missing_quarter_is_checked_by_hand(self):
         facts = [{"start": s, "end": e, "val": v, "filed": "2026-08-01"} for s, e, v in
                  [("2025-07-01", "2025-09-30", 50e9), ("2026-01-01", "2026-03-31", 40e9)]]
-        with mock.patch.object(b, "sec_concept", return_value=facts):
+        ar = [{"end": "2026-03-31", "val": 20e9, "filed": "2026-08-01"}]
+        with mock.patch.object(b, "sec_concept",
+                               side_effect=lambda cik, c: ar if c == "AccountsReceivableNetCurrent" else facts):
             page = b.block_nvidia()
         self.assertIn("Check by hand", page)
         self.assertNotIn("WARNING", page)
+
+
+def quarter_ends(n, last="2026-06-30"):
+    """n consecutive calendar quarter ends up to last."""
+    y, m = int(last[:4]), int(last[5:7])
+    out = []
+    for _ in range(n):
+        out.append(date(y, m, 30 if m in (6, 9) else 31).isoformat())
+        y, m = (y, m - 3) if m > 3 else (y - 1, 12)
+    return out[::-1]
+
+
+class Receivables(unittest.TestCase):
+    def series(self, latest_ar, n=14):
+        ends = quarter_ends(n)
+        rev = {e: 90e9 for e in ends}
+        ar = {e: 45e9 for e in ends}  # about 45 days of sales
+        ar[ends[-1]] = latest_ar
+        return rev, ar
+
+    def test_three_year_high_warns(self):
+        page = b.receivables_line(*self.series(60e9))
+        self.assertIn("WARNING", page)
+        self.assertIn("60.7 days at 2026-06-30", page)
+
+    def test_below_the_high_does_not(self):
+        rev, ar = self.series(44e9)
+        ar[quarter_ends(14)[5]] = 55e9  # an earlier high inside the three years
+        page = b.receivables_line(rev, ar)
+        self.assertIn("No warning", page)
+        self.assertIn("highest in the three years before was 55.6", page)
+
+    def test_missing_receivables_is_checked_by_hand(self):
+        rev, ar = self.series(60e9)
+        del ar[quarter_ends(14)[-1]]
+        self.assertIn("Check by hand", b.receivables_line(rev, ar))
+        self.assertIn("Check by hand", b.receivables_line(rev, {}, "sec.gov down"))
+
+    def test_too_little_history_is_checked_by_hand(self):
+        self.assertIn("Check by hand", b.receivables_line(*self.series(60e9, n=6)))
 
 
 class HeadlineCap(unittest.TestCase):
@@ -228,6 +270,30 @@ class HeadlineCap(unittest.TestCase):
         story["headlines"][0]["link"] = "https://example.com/a"
         with mock.patch.object(b, "headlines", return_value=(feeds, "")):
             self.assertIs(b.feed_block("C")[1], True)
+
+
+class CarriedOver(unittest.TestCase):
+    def rec(self, days_ago, feed="A"):
+        return {"feed": feed, "title": "T - Outlet", "link": "https://example.com/t",
+                "when": (b.NOW - timedelta(days=days_ago)).isoformat()}
+
+    def test_recent_headline_missing_from_today_is_kept(self):
+        known = {"recent": self.rec(5), "old": self.rec(40), "other feed": self.rec(5, "B"),
+                 "found today": self.rec(5), "no date": {"feed": "A", "first_seen": "2026-10-01"}}
+        taken = {"found today"}
+        kept = b.carried_over(known, "A", taken)
+        self.assertEqual([h["key"] for h in kept], ["recent"])
+        self.assertTrue(kept[0]["carried"])
+        self.assertIn("recent", taken)
+
+    def test_feed_says_how_many_were_kept(self):
+        story = {"headlines": [{"date": "2026-10-19", "link": "https://example.com/a", "title": "t",
+                                "when": None}], "verdict": "alert", "reason": "r", "new": False}
+        feeds = {"A": {"stories": [story], "error": None, "capped": False, "available": 1, "carried": 1}}
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            html, crossed, _ = b.feed_block("A")
+        self.assertIn("1 of these wasn't returned by today's search", html)
+        self.assertIs(crossed, True)
 
 
 class Stores(unittest.TestCase):
