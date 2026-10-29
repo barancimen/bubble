@@ -1,0 +1,7 @@
+{
+  "name": "bubble-watch-site",
+  "private": true,
+  "dependencies": {
+    "wrangler": "4.154.0"
+  }
+}

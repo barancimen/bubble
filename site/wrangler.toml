@@ -1,0 +1,17 @@
+# Serves dashboard.html at gestaltschaft.com/bubble. The rest of gestaltschaft.com stays with its
+# own Worker (a Custom Domain); these path routes run first, as /feeds does.
+name = "bubble-watch"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+routes = [
+  { pattern = "gestaltschaft.com/bubble", zone_name = "gestaltschaft.com" },
+  { pattern = "gestaltschaft.com/bubble/*", zone_name = "gestaltschaft.com" },
+]
+
+# publish.sh copies the latest dashboard.html to public/; it is bundled into the Worker as text.
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = false

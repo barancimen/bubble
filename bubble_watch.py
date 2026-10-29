@@ -2192,6 +2192,7 @@ def main():
     head = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+        f"<meta name='generated' content='{NOW:%Y-%m-%dT%H:%M:%SZ}'>",  # read by site/src/worker.js
         f"<title>AI Bubble Watch</title><style>{CSS}</style></head><body>",
         "<h1>AI Bubble Watch</h1>",
         f'<p class="muted">Generated {generated}. Signals from free public sources; the CDS, annuity '
