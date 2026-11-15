@@ -641,12 +641,13 @@ def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
     for s in have:
         xx = x(s.mid)
         days = f"{s.n} trade{'s' * (s.n != 1)} on {s.days} day{'s' * (s.days != 1)}"
-        thin = f"; only {s.days} trading day{'s' * (s.days != 1)}, treat with caution" if s.days < MIN_DAYS else ""
+        thin = (f" There {'was' if s.days == 1 else 'were'} only {s.days} trading day{'s' * (s.days != 1)}, so treat "
+                "this with caution." if s.days < MIN_DAYS else "")
         if s.unresolved:
             out.append(f'<rect x="{xx - 5:.1f}" y="{y(s.median):.1f}" width="10" height="{max(y(s.alt) - y(s.median), 1):.1f}" '
-                       f'rx="5" fill="{PD_COLOR}" opacity="0.18"><title>{period(s)}: who paid the up-fronts isn\'t '
-                       f'settled by the data: {s.median * 100:.0f}% if the buyers paid them, {s.alt * 100:.0f}% if '
-                       f'the sellers did ({days}{thin})</title></rect>')
+                       f'rx="5" fill="{PD_COLOR}" opacity="0.18"><title>{period(s)}. The data do not show who paid the '
+                       f'up-front payments. The chance of default is {s.median * 100:.0f}% if the buyers paid them and '
+                       f'{s.alt * 100:.0f}% if the sellers did, from {days}.{thin}</title></rect>')
             for v in (s.median, s.alt):
                 out.append(f'<circle cx="{xx:.1f}" cy="{y(v):.1f}" r="3" fill="#fff" stroke="{PD_COLOR}" stroke-width="1.5"/>')
             continue
@@ -654,8 +655,8 @@ def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
         out.append(f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{y(s.hi):.1f}" y2="{y(s.lo):.1f}" '
                    f'stroke="{PD_COLOR}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>')
         out.append(f'<circle cx="{xx:.1f}" cy="{y(s.median):.1f}" r="4" fill="{PD_COLOR}" stroke="#fff" stroke-width="2"{opacity}>'
-                   f'<title>{period(s)}: {s.median * 100:.1f}% (90% interval {s.lo * 100:.1f}–{s.hi * 100:.1f}%; '
-                   f'{days}{thin})</title></circle>')
+                   f'<title>{period(s)}. A {s.median * 100:.1f}% chance of default, with a 90% interval from '
+                   f'{s.lo * 100:.1f}% to {s.hi * 100:.1f}%, from {days}.{thin}</title></circle>')
     # levels reported in the news: diamonds
     for d, p, tip in reported:
         if start <= d <= end:
@@ -664,7 +665,7 @@ def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
                        f'fill="{NEWS_COLOR}" stroke="#fff" stroke-width="1.5"><title>{esc(tip)}</title></path>')
     if not have and not reported:
         out.append(f'<text x="{ML + pw / 2}" y="{MT + ph / 2}" text-anchor="middle" fill="{TEXT}">'
-                   'No usable CDS trades in this window</text>')
+                   'There are no usable trades in this period.</text>')
     out.append("</svg>")
     return "".join(out)
 

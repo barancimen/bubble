@@ -20,9 +20,9 @@ A new section shows private investment in computers, communications equipment an
 
 A new section shows the share of businesses in the United States that say they used AI in the last two weeks. The warning line is that share no longer rising over about three months.
 
-The stock price section now includes Digital Realty and Equinix, which own data center buildings and do not own the chips inside them. A second warning line compares the six heavily indebted companies with these two.
+The share price section now includes Digital Realty and Equinix, which own data center buildings and do not own the chips inside them. A second warning line compares the six heavily indebted companies with these two.
 
-The headlines section has a new feed called "Compute glut". It looks for idle capacity, price cuts, cancelled compute contracts, bankruptcies of GPU cloud companies and write-downs of AI chips. The limit on headlines per run was raised from 499 to 600 so that the new feed does not take room from the others.
+The news section has a new feed called "News of too much computing power". It looks for idle capacity, price cuts, cancelled contracts for computing power, bankruptcies of GPU cloud companies and write-downs of AI chips. The limit on headlines per run was raised from 499 to 600 so that the new feed does not take room from the others.
 
 The top of the page names the interview next to the other two sources. Below that is a list of every section, placed under the worst state of its warning lines, with a link to each section.
 
@@ -40,7 +40,7 @@ The annuity section used to find LIMRA's releases only through LIMRA's sitemap. 
 | Investment as a share of GDP | FRED series `A679RC1Q027SBEA`, `B935RC1Q027SBEA` and `GDP` |
 | Businesses using AI | The national spreadsheet of the Census Bureau's Business Trends and Outlook Survey |
 | Digital Realty and Equinix share prices | Yahoo Finance |
-| Compute glut headlines | Google News, judged by the same DeepSeek model as the other feeds |
+| News of too much computing power | Google News, judged by the same DeepSeek model as the other feeds |
 
 None of these needs an API key. The Census spreadsheet is an `.xlsx` file, and `xlsx_rows` in `bubble_watch.py` reads it with the standard library.
 
@@ -57,3 +57,7 @@ The dashboard also has no figures for the prices in private compute contracts, f
 ## Checking a change
 
 Run `python3 -m unittest test_bubble_watch` for the tests. Run `python3 bubble_watch.py --cached` to rebuild the page from the responses saved by the last full run. It writes `dashboard-preview.html` and makes no network or DeepSeek calls. A source that was added since the last full run has no saved response yet, so its section shows an error in the preview until the next full run.
+
+## Wording on the page
+
+All text on the page is written in plain English. Each warning line is two sentences, one that says when to start worrying and one that says whether there is a warning today. Tests look for the phrases "There is a warning today", "There is no warning today" and "This has to be checked by hand today", so a change to that wording means changing the tests as well. The rules that the news model is given are kept separate from the rules shown on the page. Changing a rule the model is given makes it judge every stored story again, while changing the text on the page does not.

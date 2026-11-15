@@ -77,11 +77,11 @@ NVDA_CIK = 1045810
 COMMITMENTS = [  # ticker, CIK, concept, what the company's filings say the tagged figure is
     ("GOOGL", 1652044, "LongTermPurchaseCommitmentAmount", "Purchase commitments, mostly long-term supply agreements"),
     ("META", 1326801, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
-     "Data-center and network leases signed but not yet started"),
+     "Data center and network leases signed but not yet started"),
     ("ORCL", 1341439, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
      "Purchase obligations for cloud components and power"),
     ("NVDA", 1045810, "UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount",
-     "Data-center leases signed but not yet started (tagged once a year)"),
+     "Data center leases signed but not yet started, tagged once a year"),
 ]
 WEAK_BORROWERS = ["CRWV", "IREN", "HUT", "CIFR", "WULF", "APLD", "ORCL"]
 WEAK_BASKET_PCT, WEAK_EACH_PCT, QQQ_CALM_PCT = 20, 15, 5  # see block_weak_borrowers
@@ -244,8 +244,8 @@ def fetch(url, ua=WEB_UA, tries=3, check=None):
             saved = json.load(f)["saved"]
     except (OSError, ValueError, KeyError):
         raise problem from None
-    note = (f"{describe(url)}: today's download failed ({short_error(problem)}), so this uses the copy "
-            f"saved {saved} UTC.")
+    note = (f"Today's download from {describe(url)} failed ({short_error(problem)}), so this section uses "
+            f"the copy saved at {saved} UTC.")
     FALLBACKS.append(note)
     warn(note)
     return saved_body
@@ -466,21 +466,37 @@ def slug(title):
 
 
 def line(rule, crossed, detail=""):
-    """The worry line for one signal and whether it is crossed now
-    (crossed=None means the reader has to check it by hand)."""
+    """The worry line for one signal and whether it is crossed now (crossed=None means the
+    reader has to check it by hand). rule completes the sentence "Start to worry when ..."."""
     if SECTION[0]:
         STATUS.append((*SECTION[0], crossed))
     if crossed is None:
-        status = "Check by hand"
+        status = "This has to be checked by hand today."
     else:
-        status = '<span class="bad">WARNING</span>' if crossed else "No warning"
+        status = '<span class="bad">There is a warning today.</span>' if crossed else "There is no warning today."
     detail = f" {detail.strip()}" if detail.strip() else ""
-    return (f'<p class="line"><b>Start worrying when:</b> {rule}<br>'
-            f"<b>Now:</b> {status}.{detail}</p>")
+    return f'<div class="line"><p>Start to worry when {rule}</p><p>{status}{detail}</p></div>'
 
 
 def no_line(text):
-    return f'<p class="line"><b>No fixed line.</b> {text}</p>'
+    return f'<div class="line"><p>This signal has no fixed warning line. {text}</p></div>'
+
+
+def and_list(items):
+    """ "A", "A and B" or "A, B and C"."""
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1] if items else ""
+
+
+def day(d):
+    """A date for a sentence, e.g. "Jul 26, 2026"."""
+    d = date.fromisoformat(d) if isinstance(d, str) else d
+    return f"{d:%b} {d.day}, {d.year}"
+
+
+def not_available(err=None):
+    """A table cell for a figure that could not be read today."""
+    return f'<span class="error">not available today{f" ({esc(err)})" if err else ""}</span>'
 
 
 def table(header, rows):
@@ -656,8 +672,9 @@ def stale(end, what, max_days=SEC_STALE_DAYS):
     """Warns (and returns a note) when the newest filed figure is older than max_days."""
     age = (TODAY - date.fromisoformat(end)).days
     if age > max_days:
-        warn(f"{what}: the newest filed figures are for {end}, {age} days ago")
-        return f" The newest figures are for {end}, which is unusually old: check for a late filing or a renamed concept."
+        warn(f"The newest filed figures for {what} are for {end}, {age} days ago.")
+        return (f" The newest figures are for {day(end)}, which is unusually old. The company may have filed "
+                "late or changed the name of the figure.")
     return ""
 
 
@@ -673,16 +690,16 @@ def per_item(items, name, fn):
             print(f"ERROR in {name(it)}: {e!r}", file=sys.stderr)
             out.append((it, None, short_error(e)))
     if all(err for *_, err in out):
-        raise RuntimeError("; ".join(f"{name(it)}: {err}" for it, _, err in out))
+        raise RuntimeError(" ".join(f"Could not read {name(it)} ({err})." for it, _, err in out))
     for it, _, err in out:
         if err:
-            warn(f"{name(it)}: unavailable today ({err})")
+            warn(f"Could not read {name(it)} today ({err}).")
     return out
 
 
 def unavailable(names):
     """The detail sentence for a worry line that is missing some of its items."""
-    return f" No data today for {', '.join(names)}, so check by hand." if names else ""
+    return f" No data could be read today for {and_list(names)}." if names else ""
 
 
 ORACLE_STORE = os.path.join(HERE, "data", "oracle_prepayments.json")
@@ -748,40 +765,41 @@ def block_hyperscalers():
         notes = stale(last, f"{ticker} capex and cash flow")
         ttm = None
         if len(ends) < 4 or not consecutive(ends[-4:]):
-            notes += f" {ticker}'s last four filed quarters ({', '.join(ends[-4:])}) aren't consecutive, so its four-quarter free cash flow isn't shown."
+            notes += (f" {ticker}'s last four filed quarters, {and_list(ends[-4:])}, are not consecutive, so its "
+                      "free cash flow over four quarters is not shown.")
         elif any(v and days_between(s, ends[-4]) > 100 for e, (v, s) in prepaid_spans.items() if e in ends[-4:]):
-            notes += (f" {ticker}'s customer prepayments are tagged only for a period reaching back before "
-                      "the last four quarters, so its four-quarter free cash flow isn't shown.")
+            notes += (f" {ticker} has tagged its customer prepayments only for a period that starts before the "
+                      "last four quarters, so its free cash flow over four quarters is not shown.")
         else:
             ttm = sum(fcf[e] for e in ends[-4:])
         untagged = [e for e in ends[-4:] if lease and e not in lease and e > min(lease)]
         if untagged:
             tagged = max(e for e in lease if e < untagged[0])
-            notes += (f" {ticker} hasn't tagged finance-lease repayments for the quarters ending "
-                      f"{' and '.join(untagged)}, so they count as zero here (${lease[tagged] / 1e9:,.2f}B in the "
-                      f"quarter ending {tagged}).")
+            notes += (f" {ticker} has not tagged finance lease repayments for the quarters ending "
+                      f"{and_list(day(e) for e in untagged)}, so they count as zero here. They were "
+                      f"${lease[tagged] / 1e9:,.2f}B in the quarter ending {day(tagged)}.")
         yoys = []
         for e in ends[-2:]:
             prior = year_earlier(capex, e)
             yoys.append((capex[e] / prior - 1) * 100 if prior else None)
         last6 = ends[-6:]
         if prepaid:
-            notes += (f" For Oracle, customer prepayments with a significant financing component "
-                      f"(${sum(prepaid.get(e, 0) for e in ends[-4:]) / 1e9:,.1f}B over the last four quarters) are "
-                      "taken out of operating cash flow: Oracle counts them there, but they are customers "
-                      "funding Oracle's build-out, not cash its business generated.")
+            notes += (" Oracle counts in its operating cash flow the money that customers pay in advance to "
+                      f"fund its data centers, ${sum(prepaid.get(e, 0) for e in ends[-4:]) / 1e9:,.1f}B over the "
+                      "last four quarters. This page takes it out, because it is customers' money and was not "
+                      "earned by Oracle's business.")
             for e, (v, s) in prepaid_spans.items():
                 if v and e in last6 and days_between(s, e) > 100:
-                    notes += (f" Oracle tagged these prepayments for {s} to {e} only as a total "
-                              f"(${v / 1e9:,.1f}B); the chart shows all of it in the quarter ending {e}.")
+                    notes += (f" Oracle tagged these prepayments from {day(s)} to {day(e)} only as one total of "
+                              f"${v / 1e9:,.1f}B, so the chart shows all of it in the quarter ending {day(e)}.")
         return dict(last=last, ttm=ttm, yoys=yoys, notes=notes,
                     panel=(ticker, last6, [capex[e] / 1e9 for e in last6], [fcf[e] / 1e9 for e in last6]))
 
     rows, panels, fcf_negative, fcf_unknown, capex_down, unknown, missing, notes = [], [], [], [], [], [], [], ""
-    for (ticker, *_), r, err in per_item(HYPERSCALERS, lambda it: f"{it[0]} capex and cash flow", company):
+    for (ticker, *_), r, err in per_item(HYPERSCALERS, lambda it: f"{it[0]}'s capital spending and cash flow", company):
         if err:
             missing.append(ticker)
-            rows.append([ticker, f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a"])
+            rows.append([ticker, not_available(err), "n/a", "n/a"])
             continue
         yoys, ttm = r["yoys"], r["ttm"]
         notes += r["notes"]
@@ -795,46 +813,47 @@ def block_hyperscalers():
             fcf_negative.append(ticker)
         panels.append(r["panel"])
         rows.append([ticker, esc(r["last"]), billions(ttm, True) if ttm is not None else "n/a",
-                     " / ".join(pct(y, True) for y in yoys)])
+                     " and ".join(pct(y, True) for y in yoys)])
     lo = min(0, *(min(f) for *_, f in panels))
     hi = max(0, *(max(c) for _, _, c, _ in panels))
-    out = legend([("Capex", SERIES[0]), ("Free cash flow", SERIES[1])])
-    out += ('<p class="muted">Last 6 quarters by quarter-end month, $B, same scale for every '
-            'company. Hover a bar for its exact value.</p><div class="multiples">')
+    out = legend([("Capital spending", SERIES[0]), ("Free cash flow", SERIES[1])])
+    out += ('<p class="muted">The last six quarters in billions of dollars, on the same scale for every '
+            'company. Hover over a bar to see its value.</p><div class="multiples">')
     out += "".join(
-        f"<div><h5>{t}</h5>" + column_chart(ends, [("Capex", SERIES[0], c), ("Free cash flow", SERIES[1], f)],
+        f"<div><h5>{t}</h5>" + column_chart(ends, [("Capital spending", SERIES[0], c), ("Free cash flow", SERIES[1], f)],
                                            money_b, (lo, hi), tip=money_tip,
-                                           aria=f"{t} capex and free cash flow, last 6 quarters") + "</div>"
+                                           aria=f"{t} capital spending and free cash flow, last six quarters") + "</div>"
         for t, ends, c, f in panels) + "</div>"
-    out += table(["Company", "Latest quarter end", "Free cash flow, last 4 quarters ($B)",
-                  "Capex vs same quarter a year earlier (previous / latest quarter)"], rows)
-    detail = f"Two quarters below a year earlier: {', '.join(capex_down)}." if capex_down else ""
+    out += table(["Company", "Latest quarter", "Free cash flow over the last four quarters ($B)",
+                  "Capital spending compared with a year earlier, previous and latest quarter"], rows)
+    detail = (f"Spending was below a year earlier in both of the last two quarters at {and_list(capex_down)}."
+              if capex_down else "")
     if unknown:
-        detail += f" No year-earlier figure for {', '.join(unknown)}, so check by hand."
+        detail += f" There is no figure from a year earlier for {and_list(unknown)}."
     detail += unavailable(missing)
     out += line(
-        "any company's quarterly capex is lower than in the same quarter a year earlier, two "
-        "quarters in a row (one lumpy quarter isn't enough). Ares's trigger is a season of "
-        "disappointing AI revenue that leads boards to shift spending; a cut to capex guidance "
-        "on an earnings call comes months before it shows up here, so read the calls: Microsoft, "
-        "Alphabet, Amazon and Meta report in late January or early February, late April, late July "
-        "and late October; Oracle in mid-March, mid-June, mid-September and mid-December.",
+        "any of these companies spends less in a quarter than in the same quarter a year earlier, two "
+        "quarters in a row. One low quarter is not enough. Ares expects a season of disappointing AI "
+        "revenue to make boards cut spending. A cut to spending plans announced on an earnings call comes "
+        "months before it shows up here, so the calls are worth reading. Microsoft, Alphabet, Amazon and "
+        "Meta report in late January or early February, late April, late July and late October, and "
+        "Oracle in mid-March, mid-June, mid-September and mid-December.",
         True if capex_down else (None if unknown or missing else False), detail)
     out += line(
-        "free cash flow over the last four quarters is below zero: over a full year, capex and "
-        "lease repayments took more than the cash the business generated. Single quarters swing "
-        "with working capital and the seasons (Amazon's first quarter is often negative), so they "
-        "don't count on their own. Ares pointed to Alphabet and Amazon posting negative free cash "
-        "flow in a recent quarter.",
+        "a company's free cash flow over the last four quarters is below zero, which means that over a "
+        "full year its capital spending and lease repayments took more cash than its business brought in. "
+        "Single quarters swing with the seasons, so they do not count on their own. Amazon's first "
+        "quarter, for example, is often negative. Ares pointed out that Alphabet and Amazon each had "
+        "negative free cash flow in a recent quarter.",
         True if fcf_negative else (None if fcf_unknown or missing else False),
-        (f"Negative over the last four quarters: {', '.join(fcf_negative)}." if fcf_negative else "")
-        + (f" No four-quarter figure for {', '.join(fcf_unknown)}, so check by hand." if fcf_unknown else "")
+        (f"Free cash flow over the last four quarters was negative at {and_list(fcf_negative)}." if fcf_negative else "")
+        + (f" There is no four-quarter figure for {and_list(fcf_unknown)}." if fcf_unknown else "")
         + unavailable(missing))
-    out += ('<p class="muted">Free cash flow here = operating cash flow − purchases of property and '
-            "equipment − principal repayments of finance leases (where reported), as filed; this is "
-            "Meta's own definition. Amazon's headline figure nets proceeds from asset sales against "
-            "capex, and Microsoft's headline capex includes assets taken on through finance leases, so "
-            f"their own figures differ.{notes}</p>")
+    out += ('<p class="muted">Free cash flow here is operating cash flow minus purchases of property and '
+            "equipment and minus repayments of finance leases where they are reported, all as filed. This "
+            "is Meta's own definition. Amazon's and Microsoft's own figures differ, because Amazon subtracts "
+            "the proceeds of asset sales from its spending and Microsoft counts assets taken on through "
+            f"finance leases as spending.{notes}</p>")
     return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
 
 
@@ -875,56 +894,55 @@ def block_payback():
     ratio = lambda v: f'<span class="bad">{v:.2f}</span>' if v < 1 else f"{v:.2f}"
     rows, short, unknown, missing, notes = [], [], [], [], ""
     capex_sum = need_sum = added_sum = 0
-    for (ticker, *_), r, err in per_item(HYPERSCALERS, lambda it: f"{it[0]} revenue and capex", company):
+    for (ticker, *_), r, err in per_item(HYPERSCALERS, lambda it: f"{it[0]}'s revenue and capital spending", company):
         if err:
             missing.append(ticker)
-            rows.append([ticker, f'<span class="error">unavailable today: {esc(err)}</span>'] + ["n/a"] * 6)
+            rows.append([ticker, not_available(err)] + ["n/a"] * 6)
             continue
         if r.get("capex", 0) <= 0 or r["rev0"] <= 0 or r["capex0"] <= 0:
             unknown.append(ticker)
             rows.append([ticker, esc(r["last"] or "n/a")] + ["n/a"] * 6)
             continue
-        notes += stale(r["last"], f"{ticker} revenue and capex")
+        notes += stale(r["last"], f"{ticker}'s revenue and capital spending")
         need, added = r["capex"] * REVENUE_PER_CAPEX, r["rev"] - r["rev0"]
         capex_sum, need_sum, added_sum = capex_sum + r["capex"], need_sum + need, added_sum + added
         if added < need:
             short.append(ticker)
         rows.append([ticker, esc(r["last"]), billions(r["capex"]),
-                     f"{r['capex'] / r['rev'] * 100:.0f}% ({r['capex0'] / r['rev0'] * 100:.0f}%)",
-                     f"{grew(r['dep'], r['dep0'])} (revenue {grew(r['rev'], r['rev0'])})" if r.get("dep0") else "n/a",
+                     f"{r['capex'] / r['rev'] * 100:.0f}%, was {r['capex0'] / r['rev0'] * 100:.0f}%",
+                     f"{grew(r['dep'], r['dep0'])}, revenue {grew(r['rev'], r['rev0'])}" if r.get("dep0") else "n/a",
                      billions(need), billions(added, True), ratio(added / need)])
     counted = len(rows) - len(missing) - len(unknown)
     if counted > 1:
-        rows.append([f"<b>The {counted} together</b>", "", billions(capex_sum), "", "", billions(need_sum),
+        rows.append([f"<b>All {counted}</b>", "", billions(capex_sum), "", "", billions(need_sum),
                      billions(added_sum, True), ratio(added_sum / need_sum)])
-    out = table(["Company", "Four quarters to", "Capex ($B)", "Capex as % of revenue (a year earlier)",
-                 "Depreciation vs a year earlier", "New revenue that capex needs every year ($B)",
-                 "Revenue added over the year ($B)", "Added ÷ needed"], rows)
+    out = table(["Company", "Four quarters to", "Capital spending ($B)", "Spending as % of revenue",
+                 "Growth in depreciation", "Revenue the spending needs each year ($B)",
+                 "Revenue added over the year ($B)", "Revenue added divided by revenue needed"], rows)
     out += line(
-        "any of the five adds less revenue over four quarters than the capex of those quarters needs, "
-        f'on <a href="{HEMPTON_URL}">John Hempton</a>\'s arithmetic. He reckons the roughly $7 trillion '
-        "of AI capex planned to the end of 2030 needs about $2 trillion of revenue a year: the chips "
-        "last about five years, so getting the money back takes $1.2–1.5 trillion a year after the "
-        f"cost of running them, which is high. That is about {REVENUE_PER_CAPEX * 100:.0f} cents of "
-        "new revenue, every year, for each dollar of capex. He doubts it can be found: households "
-        "won't pay that much, and businesses would pay it only out of wages saved, about $4 trillion "
-        "a year, a tenth of the wage bill of the whole OECD.",
+        "any of the five companies adds less revenue over four quarters than its capital spending in those "
+        f'quarters needs, by <a href="{HEMPTON_URL}">John Hempton</a>\'s arithmetic. He estimates that the '
+        "roughly $7 trillion of AI spending planned up to the end of 2030 needs about $2 trillion of revenue "
+        "a year. The chips last about five years and cost a lot to run, so earning the money back takes "
+        "$1.2 to 1.5 trillion a year after running costs. That works out at about "
+        f"{REVENUE_PER_CAPEX * 100:.0f} cents of new revenue each year for every dollar spent. He doubts that "
+        "much revenue exists. Households will not pay it, and businesses would pay it only out of wages "
+        "they save, about $4 trillion a year, which is a tenth of all wages paid in OECD countries.",
         True if short else (None if unknown or missing else False),
-        (f"Added less than the capex needs: {', '.join(short)}." if short else "")
-        + (f" The {counted} together added ${added_sum / 1e9:,.0f}B against ${need_sum / 1e9:,.0f}B needed."
+        (f"{and_list(short)} added less revenue than the spending needs." if short else "")
+        + (f" All {counted} together added ${added_sum / 1e9:,.0f}B, against ${need_sum / 1e9:,.0f}B needed."
            if counted > 1 else "")
-        + (f" Two full years of consecutive quarters aren't filed for {', '.join(unknown)}, so check by hand."
-           if unknown else "")
+        + (f" {and_list(unknown)} has not filed two full years of consecutive quarters." if unknown else "")
         + unavailable(missing) + notes)
-    out += ('<p class="muted">A rough test, and the 2-in-7 ratio is Hempton\'s estimate, not a law. It is '
-            "generous to the companies in one way: revenue added counts every business they have (ads, "
-            "shopping, software), not only AI. It is harsh in others: capex counts everything they build "
-            "(Amazon's warehouses too), all of it is treated as new capacity rather than replacement, and "
-            "a data center earns nothing until it is switched on, so revenue follows capex with a lag. "
-            "Depreciation (property and equipment, as filed) is the cost of past capex arriving in "
-            "profits: where it grows faster than revenue, margins are being squeezed. Hempton notes how "
-            "much rides on the assumed life of the chips: Google moved its own estimate from four years to "
-            "six, which changed its stated profits by billions.</p>")
+    out += ('<p class="muted">This is a rough test, and the ratio of 2 to 7 is only Hempton\'s estimate. The '
+            "test is generous to the companies because the revenue added comes from all of their businesses, "
+            "such as advertising, shopping and software, and not only from AI. It is harsh because spending "
+            "includes everything they build, such as Amazon's warehouses, because some of it replaces old "
+            "equipment, and because a data center earns nothing until it is switched on. Depreciation of "
+            "property and equipment is the cost of past spending as it reaches profits, and where it grows "
+            "faster than revenue, profit margins are being squeezed. Hempton points out how much depends on "
+            "how long the chips are assumed to last. When Google changed its estimate from four years to six, "
+            "its reported profits changed by billions of dollars.</p>")
     return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
 
 
@@ -933,23 +951,24 @@ def block_nvidia():
     ends = list(rev)[-6:]
     gap = not consecutive(ends[-2:])
     change = None if gap else (rev[ends[-1]] / rev[ends[-2]] - 1) * 100
-    out = ('<p class="muted">Quarterly revenue by quarter-end month, $B. Hover a bar for its '
-           'exact value.</p><div style="max-width:480px">'
+    out = ('<p class="muted">Revenue each quarter in billions of dollars. Hover over a bar to see its '
+           'value.</p><div style="max-width:480px">'
            + column_chart(ends, [("Revenue", SERIES[0], [rev[e] / 1e9 for e in ends])], money_b,
                           w=480, h=220, tip=money_tip, aria="Nvidia quarterly revenue, last 6 quarters") + "</div>")
-    out += line("revenue falls from the previous quarter. Nvidia's sales are AI spending arriving; "
-                "a sequential drop means buyers are slowing down. Nvidia also guides the next "
-                "quarter's revenue in its results (late February, May, August and November); a guide "
-                "below the latest quarter is an earlier warning than this line.",
+    out += line("Nvidia's revenue falls from one quarter to the next. Its sales are where AI spending "
+                "arrives, so a fall means buyers are slowing down. Nvidia also forecasts the next quarter's "
+                "revenue when it reports, in late February, May, August and November, and a forecast below "
+                "the latest quarter is an earlier warning than this line.",
                 None if gap else change < 0,
-                (f"The latest two filed quarters ({ends[-2]} and {ends[-1]}) aren't consecutive, so check by hand."
-                 if gap else f"Latest quarter vs previous: {pct(change, True)}.") + stale(ends[-1], "Nvidia revenue"))
+                (f"The latest two filed quarters, {day(ends[-2])} and {day(ends[-1])}, are not consecutive."
+                 if gap else f"Revenue changed by {pct(change, True)} from the quarter before.")
+                + stale(ends[-1], "Nvidia's revenue"))
     try:  # the receivables shouldn't take the revenue line down with them
         ar, ar_err = point_in_time(sec_concept(NVDA_CIK, "AccountsReceivableNetCurrent")), None
     except Exception as e:
         print(f"ERROR in Nvidia receivables: {e!r}", file=sys.stderr)
         ar, ar_err = {}, short_error(e)
-        warn(f"Nvidia receivables: unavailable today ({ar_err})")
+        warn(f"Could not read Nvidia's receivables today ({ar_err}).")
     out += receivables_line(rev, ar, ar_err)
     return out + source("SEC EDGAR XBRL filings (Nvidia)",
                         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
@@ -973,46 +992,47 @@ def receivables_line(rev, ar, err=None):
         return dso[ends[i]] > max(dso[e] for e in before)
 
     past = [f"{date.fromisoformat(e):%b %Y}" for i, e in enumerate(ends[:-1]) if at_high(i)]
-    rule = ("customers owe Nvidia more days of sales than at any quarter end in the previous three "
-            "years (receivables at quarter end ÷ the quarter's revenue × days in the quarter). Slower "
-            "payment can mean Nvidia is giving buyers longer terms to keep sales going, in effect "
-            "lending to them; it can also just mean shipments bunched at the end of the quarter, so "
-            "read the explanation in the 10-Q.")
+    rule = ("customers owe Nvidia more days of sales than at any quarter end in the previous three years. "
+            "This is the money owed at the end of a quarter divided by that quarter's revenue, times the "
+            "days in the quarter. Slower payment can mean that Nvidia is giving buyers longer to pay to keep "
+            "sales going, which amounts to lending to them. It can also mean only that shipments were "
+            "bunched at the end of the quarter, so read the explanation in the 10-Q.")
     first = next((e for i, e in enumerate(ends) if at_high(i) is not None), None)
     if past:
-        rule += (f" Since {first[:4]} this happened at {', '.join(past)}; Nvidia's revenue fell "
+        rule += (f" Since {first[:4]} this has happened in {and_list(past)}. Nvidia's revenue fell "
                  "from late 2018 and from mid-2022.")
     last = allq[-1] if allq else None
     if err or last not in dso:
-        why = f"unavailable today ({esc(err)})" if err else f"not filed for the quarter ending {last}"
-        return line(rule, None, f"Nvidia's receivables are {why}, so check by hand.")
+        return line(rule, None, f"Nvidia's receivables could not be read today ({esc(err)})." if err
+                    else f"Nvidia has not filed its receivables for the quarter ending {day(last)}.")
     i = len(ends) - 1
     verdict = at_high(i)
     if verdict is None:
-        return line(rule, None, "A quarter is missing from the three years of filed figures, so check by hand.")
+        return line(rule, None, "A quarter is missing from the last three years of filed figures.")
     before = ends[i - DSO_LOOKBACK:i]
     high = max(before, key=dso.get)
     return line(rule, verdict,
-                f"{dso[last]:.1f} days at {last}, {dso[ends[i - 1]]:.1f} the quarter before; the "
-                f"highest in the three years before was {dso[high]:.1f} ({high}).")
+                f"Customers owed {dso[last]:.1f} days of sales on {day(last)} and {dso[ends[i - 1]]:.1f} a quarter "
+                f"earlier. The highest in the three years before was {dso[high]:.1f}, on {day(high)}.")
 
 
-NVDA_FINANCING = [  # XBRL concept, what the figure is
-    ("EquitySecuritiesWithoutReadilyDeterminableFairValueAmount", "Stakes in private companies (no market price)"),
-    ("EquitySecuritiesFvNi", "Shares in listed companies"),
-    ("GuaranteeObligationsMaximumExposure", "Guarantees given: the most Nvidia could have to pay"),
+NVDA_FINANCING = [  # XBRL concept, what the figure is, a short name for sentences
+    ("EquitySecuritiesWithoutReadilyDeterminableFairValueAmount", "Stakes in private companies, which have no market price",
+     "stakes in private companies"),
+    ("EquitySecuritiesFvNi", "Shares in listed companies", "shares in listed companies"),
+    ("GuaranteeObligationsMaximumExposure", "Guarantees given, at the most Nvidia could have to pay", "guarantees"),
 ]
 
 
 def block_nvidia_financing():
     """Circular funding: what Nvidia has put into, or promised on behalf of, other companies, many
     of them its customers, and whether those stakes are gaining or losing value."""
-    fetched = per_item(NVDA_FINANCING, lambda it: f"Nvidia: {it[1].split(':')[0].split(' (')[0].lower()}",
+    fetched = per_item(NVDA_FINANCING, lambda it: f"Nvidia's {it[2]}",
                        lambda it: point_in_time(sec_concept_or_empty(NVDA_CIK, it[0])))
     rows, latest, chart, notes = [], {}, "", ""
-    for (concept, what), series, err in fetched:
+    for (concept, what, short), series, err in fetched:
         if err:
-            rows.append([esc(what), f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a"])
+            rows.append([esc(what), not_available(err), "n/a", "n/a"])
             continue
         if not series:
             rows.append([esc(what), "not reported", "n/a", "n/a"])
@@ -1022,19 +1042,19 @@ def block_nvidia_financing():
         # The figure nearest a year back; the guarantees aren't tagged every quarter, hence the wide window.
         earlier = [(e, v) for e, v in series.items() if 250 <= days_between(e, last) <= 460]
         prev = min(earlier, key=lambda ev: abs(days_between(ev[0], last) - 365)) if earlier else None
-        note = stale(last, f"Nvidia: {what.split(':')[0].split(' (')[0].lower()}", 400)
+        note = stale(last, f"Nvidia's {short}", 400)
         notes = notes or note
         rows.append([esc(what), f"${series[last] / 1e9:,.1f}B ({esc(last)})",
                      f"${prev[1] / 1e9:,.1f}B ({esc(prev[0])})" if prev else "n/a",
                      (f"×{series[last] / prev[1]:.1f}" if prev and prev[1] > 0 else "n/a") + (" *" if note else "")])
         ends = list(series)[-6:]
         if concept == NVDA_FINANCING[0][0] and len(ends) > 1 and consecutive(ends):
-            chart = ('<p class="muted">Nvidia\'s stakes in private companies at each quarter end, $B. Hover a '
-                     'bar for its exact value.</p><div style="max-width:480px">'
+            chart = ('<p class="muted">Nvidia\'s stakes in private companies at the end of each quarter, in '
+                     'billions of dollars. Hover over a bar to see its value.</p><div style="max-width:480px">'
                      + column_chart(ends, [("Stakes in private companies", SERIES[0], [series[e] / 1e9 for e in ends])],
                                     money_b, w=480, h=220, tip=money_tip,
-                                    aria="Nvidia's stakes in private companies, last 6 quarters") + "</div>")
-    out = chart + table(["What Nvidia's filing tags", "Latest", "About a year earlier", "Change"], rows)
+                                    aria="Nvidia's stakes in private companies, last six quarters") + "</div>")
+    out = chart + table(["What Nvidia's filings tag", "Latest", "About a year earlier", "Change"], rows)
     newest = max((d for d, _ in latest.values()), default=None)
     together = sum(v for d, v in latest.values() if d == newest)
     scale = ""
@@ -1042,51 +1062,50 @@ def block_nvidia_financing():
         rev = quarterly_flows(sec_concept(NVDA_CIK, "Revenues"))
         ends = list(rev)[-4:]
         if newest and len(ends) == 4 and consecutive(ends) and sum(1 for d, _ in latest.values() if d == newest) > 1:
-            scale = (f" At {newest} the figures above came to ${together / 1e9:,.0f}B together, against "
+            scale = (f" On {day(newest)} these figures added up to ${together / 1e9:,.0f}B, against "
                      f"${sum(rev[e] for e in ends) / 1e9:,.0f}B of revenue over Nvidia's last four quarters.")
     except Exception as e:
         print(f"ERROR in Nvidia revenue (for scale): {e!r}", file=sys.stderr)
-    rule = ("Nvidia reports a net loss on its investments for a quarter: the companies it has funded are "
-            "being marked down, or their shares are falling. Nvidia sells chips to companies it also puts "
-            "money into or guarantees, so some of its sales are paid for with its own money; "
-            f'<a href="{HEMPTON_URL}">Hempton</a>: "circular funding has almost always been bad news in '
-            'finance", though here he thinks the spending is real and the money has to come from '
-            f"somewhere.{scale}")
+    rule = ("Nvidia reports a net loss on its investments in a quarter, which means that the companies it "
+            "has funded are valued lower or their shares are falling. Nvidia sells chips to companies that it "
+            "also invests in or guarantees, so some of its sales are paid for with its own money. "
+            f'<a href="{HEMPTON_URL}">John Hempton</a> says that "circular funding has almost always been '
+            f'bad news in finance", although he thinks the spending in this case is real.{scale}')
     try:
         gains, err = quarterly_flows(sec_concept_or_empty(NVDA_CIK, "GainLossOnInvestments")), None
     except Exception as e:
         print(f"ERROR in Nvidia investment gains: {e!r}", file=sys.stderr)
         gains, err = {}, short_error(e)
-        warn(f"Nvidia investment gains: unavailable today ({err})")
+        warn(f"Could not read Nvidia's gains and losses on investments today ({err}).")
     ends = list(gains)
-    gain = lambda e: f"{'−' if gains[e] < 0 else '+'}${abs(gains[e]) / 1e9:,.1f}B"
+    gain = lambda e: f"a {'loss' if gains[e] < 0 else 'gain'} of ${abs(gains[e]) / 1e9:,.1f}B"
     if not ends:
-        out += line(rule, None, "Nvidia's gains and losses on investments are "
-                    + (f"unavailable today ({esc(err)})" if err else "not tagged in its filings") + ", so check by hand.")
+        out += line(rule, None, "Nvidia's gains and losses on investments "
+                    + (f"could not be read today ({esc(err)})." if err else "are not tagged in its filings."))
     elif (TODAY - date.fromisoformat(ends[-1])).days > SEC_STALE_DAYS:
-        out += line(rule, None, f"The newest tagged figure is for the quarter ending {ends[-1]}, so check by hand.")
+        out += line(rule, None, f"The newest tagged figure is for the quarter ending {day(ends[-1])}.")
     else:
         out += line(rule, gains[ends[-1]] < 0,
-                    f"Quarter ending {ends[-1]}: {gain(ends[-1])}"
-                    + (f"; the quarter before: {gain(ends[-2])}." if len(ends) > 1 and consecutive(ends[-2:]) else "."))
-    out += ('<p class="muted">These are Nvidia\'s own tagged totals and are not split by company: the stakes '
-            "include companies that aren't customers. Its 10-Q describes the guarantees as covering land, "
-            "power and building leases for companies that run AI data centers, should they default; the "
-            "figure is the most it could have to pay, and the commitments note there has the details. Gains "
-            "include paper gains when a private company raises money at a higher price, so they can be "
-            "large while nothing has been sold." + notes.replace(" The newest", " * The newest", 1) + "</p>")
+                    f"Nvidia reported {gain(ends[-1])} on its investments in the quarter ending {day(ends[-1])}"
+                    + (f", after {gain(ends[-2])} the quarter before." if len(ends) > 1 and consecutive(ends[-2:]) else "."))
+    out += ('<p class="muted">These are Nvidia\'s own totals. They are not split by company, and some of the '
+            "companies are not customers. Nvidia's 10-Q says that the guarantees cover the land, power and "
+            "building leases of companies that run AI data centers, in case they default. The figure is the "
+            "most Nvidia could have to pay, and the 10-Q's note on commitments gives the details. Gains include "
+            "paper gains when a private company raises money at a higher price, so they can be large although "
+            "nothing has been sold." + notes.replace(" The newest", " * The newest", 1) + "</p>")
     return out + source("SEC EDGAR XBRL filings (Nvidia)",
                         "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
 
 
 def block_backlog():
     rows, crossed, unknown, missing, panels, dips, notes = [], [], [], [], [], [], ""
-    fetched = per_item(BACKLOG, lambda it: f"{it[0]} backlog",
+    fetched = per_item(BACKLOG, lambda it: f"{it[0]}'s backlog",
                        lambda it: point_in_time(sec_concept(it[1], "RevenueRemainingPerformanceObligation")))
     for (ticker, _), rpo, err in fetched:
         if err or not rpo:
             missing.append(ticker)
-            rows.append([ticker, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>', "n/a", "n/a"])
+            rows.append([ticker, not_available(err), "n/a", "n/a"])
             continue
         ends = list(rpo)
         q = [(rpo[e] / rpo[p] - 1) * 100 if consecutive([p, e]) else None  # None: a quarter is missing
@@ -1099,40 +1118,42 @@ def block_backlog():
             unknown.append(ticker)
         worst = min(((c, e) for c, e in zip(q, ends[1:]) if c is not None), default=None)
         if worst and worst[0] < 0:
-            dips.append(f"{ticker} {worst[0]:.1f}% ({date.fromisoformat(worst[1]):%b %Y})")
-        notes += stale(ends[-1], f"{ticker} backlog")
+            dips.append(f"{worst[0]:.1f}% at {ticker} in {date.fromisoformat(worst[1]):%B %Y}")
+        notes += stale(ends[-1], f"{ticker}'s backlog")
         last6 = ends[-6:]
         panels.append((ticker, last6, [rpo[e] / 1e9 for e in last6]))
         rows.append([ticker, esc(ends[-1]), pct(q[-1], True) if q else "n/a", pct(yoy, True)])
     domain = (0, max(max(v) for *_, v in panels))
-    out = ('<p class="muted">Contract backlog, last 6 quarters by quarter-end month, $B, same scale '
-           'for every company. Hover a bar for its exact value.</p><div class="multiples">')
+    out = ('<p class="muted">Contract backlog over the last six quarters in billions of dollars, on the same '
+           'scale for every company. Hover over a bar to see its value.</p><div class="multiples">')
     out += "".join(f"<div><h5>{t}</h5>" + column_chart(ends, [("Backlog", SERIES[0], v)], money_b, domain,
-                                                      tip=money_tip, aria=f"{t} contract backlog, last 6 quarters")
+                                                      tip=money_tip, aria=f"{t} contract backlog, last six quarters")
                    + "</div>" for t, ends, v in panels) + "</div>"
-    out += table(["Company", "Latest quarter end", "vs previous quarter", "vs a year earlier"], rows)
+    out += table(["Company", "Latest quarter", "Change from the quarter before", "Change from a year earlier"], rows)
     out += line(
-        "backlog at any of the four is lower than a year earlier, or has fallen two quarters in "
-        "a row. Much of it is reported to be OpenAI and Anthropic compute commitments (e.g. OpenAI's "
-        "reported $300B deal with Oracle), so a sustained fall can mean commitments are being cut "
-        "or renegotiated. CoreWeave's backlog also secures its GPU loans. A single quarterly dip isn't enough: backlog is worked off as it is "
-        "delivered (Microsoft expects to recognize about 30% of its backlog within 12 months), and "
-        "the largest one-quarter dips in the filed history are " + "; ".join(dips) + ".",
+        "backlog at any of the four companies is lower than a year earlier, or has fallen two quarters in a "
+        "row. Backlog is work that customers have signed for and that has not been delivered yet. Much of it "
+        "is reported to be computing power promised to OpenAI and Anthropic, such as OpenAI's reported $300B "
+        "deal with Oracle, so a lasting fall can mean those deals are being cut or renegotiated. CoreWeave's "
+        "backlog also secures its GPU loans. One quarter's fall is not enough, because backlog shrinks as "
+        "work is delivered. Microsoft expects to deliver about 30% of its backlog within 12 months. The "
+        f"largest falls in a single quarter in the filed figures were {and_list(dips)}.",
         True if crossed else (None if unknown or missing else False),
-        (f"Lower than a year earlier or down two quarters in a row: {', '.join(crossed)}." if crossed else "")
-        + (f" A quarter is missing from {', '.join(unknown)}'s latest filed figures, so check by hand." if unknown else "")
+        (f"Backlog is lower than a year earlier, or has fallen two quarters in a row, at {and_list(crossed)}."
+         if crossed else "")
+        + (f" A quarter is missing from the latest filed figures for {and_list(unknown)}." if unknown else "")
         + unavailable(missing) + notes)
-    return out + source("SEC EDGAR XBRL filings (remaining performance obligations)",
+    return out + source("SEC EDGAR XBRL filings, remaining performance obligations",
                         "https://www.sec.gov/edgar/search/")
 
 
 def block_commitments():
     rows = []
-    fetched = per_item(COMMITMENTS, lambda it: f"{it[0]} commitments",
+    fetched = per_item(COMMITMENTS, lambda it: f"{it[0]}'s commitments",
                        lambda it: point_in_time(sec_concept_or_empty(it[1], it[2])))
     for (ticker, _, _, what), series, err in fetched:
         if err:
-            rows.append([ticker, esc(what), f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a"])
+            rows.append([ticker, esc(what), not_available(err), "n/a", "n/a"])
             continue
         if not series:
             rows.append([ticker, esc(what), "not reported", "n/a", "n/a"])
@@ -1140,19 +1161,18 @@ def block_commitments():
         last = list(series)[-1]
         earlier = [(e, v) for e, v in series.items() if 300 <= days_between(e, last) <= 460]
         prev = earlier[-1] if earlier else None
-        note = stale(last, f"{ticker} commitments", 400)  # some are tagged only once a year
+        note = stale(last, f"{ticker}'s commitments", 400)  # some are tagged only once a year
         rows.append([ticker, esc(what), f"${series[last] / 1e9:,.1f}B ({esc(last)})",
                      f"${prev[1] / 1e9:,.1f}B ({esc(prev[0])})" if prev else "n/a",
                      (f"×{series[last] / prev[1]:.1f}" if prev and prev[1] > 0 else "n/a") + (" *" if note else "")])
     out = table(["Company", "What the filing says it is", "Latest", "About a year earlier", "Change"], rows)
     out += no_line(
-        "These are payments the companies have signed up for that are not on their balance sheets as "
-        "debt: leases for data centers that haven't started yet, and long-term purchase and supply "
-        "agreements. Ares counts about $3 trillion of such lease and purchase commitments across the "
-        "eight largest AI companies. Each company tags a different thing, so compare a company with "
-        "its own past, not with the others. Microsoft and Amazon don't tag a comparable figure; "
-        "Alphabet's and Oracle's leases not yet started, and Nvidia's much larger supply and capacity "
-        "commitments, appear only in the text of their filings. "
+        "These are payments the companies have committed to that do not appear on their balance sheets as "
+        "debt, such as leases of data centers that have not started yet and long-term purchase and supply "
+        "agreements. Ares counts about $3 trillion of such commitments at the eight largest AI companies. "
+        "Each company tags something different, so compare each company with its own past. Microsoft and "
+        "Amazon do not tag a comparable figure. Alphabet's and Oracle's leases that have not started, and "
+        "Nvidia's much larger supply and capacity commitments, appear only in the text of their filings. "
         "Worry when these keep growing much faster than the companies' cash flow.")
     return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
 
@@ -1162,7 +1182,7 @@ def gpu_other_ways(slug, name, on_demand):
     (row, 13-week change in the spot price or None, worst such change so far or None)."""
     since = [w for w in gpu_weekly(slug, "SPOT") if w[0] >= GPU_START.isoformat()]
     if not since:
-        return [name, "none listed", "n/a", "n/a", "n/a", "n/a"], None, None
+        return [name, "no spot listings", "n/a", "n/a", "n/a", "n/a"], None, None
     week, price, sellers = since[-1]
     last = date.fromisoformat(week)
     c13 = gpu_change(since, last, 13, GPU_SPOT_MIN_SELLERS)
@@ -1172,10 +1192,10 @@ def gpu_other_ways(slug, name, on_demand):
     year = gpu_weekly(slug, "RESERVATION", "12")
     reserved = "n/a"
     if year and on_demand.get(year[-1][0]):
-        reserved = (f"${year[-1][1]:.2f}, {year[-1][1] / on_demand[year[-1][0]] * 100:.0f}% of on-demand "
-                    f"({year[-1][2]} sellers)")
+        reserved = (f"${year[-1][1]:.2f}, {year[-1][1] / on_demand[year[-1][0]] * 100:.0f}% of on-demand, "
+                    f"{year[-1][2]} sellers")
     bad = c13 is not None and c13 <= -GPU_SPOT_DROP_13W_PCT
-    return ([name, f"${price:.2f} ({esc(week)}, {sellers} sellers)", share,
+    return ([name, f"${price:.2f} in the week of {esc(week)}, {sellers} sellers", share,
              f'<span class="bad">{pct(c13)}</span>' if bad else pct(c13) if c13 is not None else "too few sellers",
              pct(worst), reserved], c13, worst)
 
@@ -1188,22 +1208,21 @@ def block_gpu_prices():
     for i, ((slug, name), weeks, err) in enumerate(fetched):
         if err or len(weeks) < 2:
             missing.append(name)
-            rows.append([name, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>',
-                         "n/a", "n/a", "n/a", "n/a", "n/a"])
+            rows.append([name, not_available(err), "n/a", "n/a", "n/a", "n/a", "n/a"])
             continue
         try:  # the spot prices shouldn't take the on-demand line down with them
             row, spot13, worst_spot = gpu_other_ways(slug, name, {w: p for w, p, _ in weeks})
         except Exception as e:
             print(f"ERROR in {name} spot prices: {e!r}", file=sys.stderr)
-            warn(f"{name} spot prices: unavailable today ({short_error(e)})")
-            row, spot13, worst_spot = [name, '<span class="error">unavailable today</span>'] + ["n/a"] * 4, None, None
+            warn(f"Could not read {name} spot prices today ({short_error(e)}).")
+            row, spot13, worst_spot = [name, not_available()] + ["n/a"] * 4, None, None
         spot_rows.append(row)
         if spot13 is None:
             spot_thin.append(name)
         elif spot13 <= -GPU_SPOT_DROP_13W_PCT:
             spot_crossed.append(name)
         if worst_spot is not None:
-            spot_worst.append(f"{name} {worst_spot:+.1f}%")
+            spot_worst.append(f"{worst_spot:+.1f}% for {name}")
         lines.append((name, SERIES[i], [(w, p) for w, p, _ in weeks]))
         week, price, providers = weeks[-1]
         avg = lambda j: st.mean(p for _, p, _ in weeks[j - GPU_AVG_WEEKS + 1:j + 1])  # 4-week average ending at week j
@@ -1216,62 +1235,65 @@ def block_gpu_prices():
             crossed.append(name)
         worst = min((change(13, j) for j in range(13 + GPU_AVG_WEEKS - 1, len(weeks))), default=None)
         if worst is not None:
-            worst_text.append(f"{name} {worst:+.1f}%")
-        mix = " (provider count changed by more than a fifth this week)" if abs(providers - weeks[-2][2]) > 0.2 * weeks[-2][2] else ""
+            worst_text.append(f"{worst:+.1f}% for {name}")
+        mix = ", more than a fifth more or fewer than the week before" if abs(providers - weeks[-2][2]) > 0.2 * weeks[-2][2] else ""
         rows.append([
             name, f"${price:.2f}", f"{esc(week)}, {providers} providers{mix}",
             pct(change(4)),
             f'<span class="bad">{pct(c13)}</span>' if name in crossed else pct(c13),
-            pct(worst), pct((avg(len(weeks) - 1) / avg(GPU_AVG_WEEKS - 1) - 1) * 100) + f" (since {esc(weeks[0][0])})",
+            pct(worst), pct((avg(len(weeks) - 1) / avg(GPU_AVG_WEEKS - 1) - 1) * 100) + f" since {esc(weeks[0][0])}",
         ])
     out = legend([(n, c) for n, c, _ in lines])
-    out += ('<p class="muted">Weekly median advertised on-demand price, $/GPU-hour (sold-out listings '
-            'excluded; a median also moves when providers come and go); vertical lines mark the start '
-            'of each month. Hover a line for the week and price.</p>')
+    out += ('<p class="muted">The weekly median advertised price for renting one GPU on demand, in dollars '
+            'per hour. Sold-out listings are left out, and the median also moves when providers come and go. '
+            'Vertical lines mark the start of each month. Hover over a line to see the week and price.</p>')
     fmt = lambda v, tick=False: f"${v:.0f}" if tick else f"${v:.2f}"
     out += (f'<div class="wide">{line_chart(lines, fmt, aria="Weekly median GPU rental prices")}</div>'
             f'<div class="narrow">{line_chart(lines, fmt, w=380, h=260, label_every=3, aria="Weekly median GPU rental prices")}</div>')
-    out += table(["GPU", "Latest weekly median, $/GPU-hour", "Latest week", "4 weeks", "13 weeks",
-                  "Worst 13-week change", "Whole series"], rows)
+    out += table(["GPU", "Latest weekly median, $ per hour", "Latest week", "Change over 4 weeks",
+                  "Change over 13 weeks", "Worst 13-week change", "Change since the series began"], rows)
     out += line(
-        f"the {GPU_AVG_WEEKS}-week average of the on-demand median falls {GPU_DROP_13W_PCT}% or more over "
-        "13 weeks (about 90 days). Changes compare 4-week averages, because single weeks jump when "
-        "listings sell out or providers come and go. Since the source switched to automated price "
-        f"collection ({GPU_START:%b %-d, %Y}), the worst 13-week changes were: {', '.join(worst_text)}. "
-        "Falling rental prices mean the chips backing GPU loans are losing value faster than lenders "
-        "assumed. (Ares's chart covers 2023–25, when H100 rentals fell from about $8.50 to $3.00; Ares "
-        "ties the risk to new chip generations, which Nvidia now ships roughly every year.)",
+        f"the {GPU_AVG_WEEKS}-week average on-demand price falls {GPU_DROP_13W_PCT}% or more over 13 weeks, "
+        "which is about three months. Changes compare 4-week averages because single weeks jump when "
+        "listings sell out or providers come and go. Since the source began collecting prices automatically "
+        f"on {day(GPU_START)}, the worst 13-week changes were {and_list(worst_text)}. Falling rental prices "
+        "mean that the chips securing GPU loans are losing value faster than lenders assumed. Ares's chart "
+        "covers 2023 to 2025, when H100 rentals fell from about $8.50 an hour to $3.00, and Ares links the "
+        "risk to new generations of chips, which Nvidia now releases about once a year.",
         True if crossed else (None if missing else False),
-        (f"Down {GPU_DROP_13W_PCT}% or more over 13 weeks: {', '.join(crossed)}." if crossed else "") + unavailable(missing))
+        (f"The price fell {GPU_DROP_13W_PCT}% or more over 13 weeks for {and_list(crossed)}." if crossed else "")
+        + unavailable(missing))
     if spot_rows:
-        out += ("<h4>Other ways to rent the same GPUs</h4>"
-                '<p class="muted">Spot capacity is rented by the hour with no commitment and can be taken '
-                "back at any time: it is what a provider hasn't sold any other way. Reserved means "
-                "committing for a year. Weekly medians, each provider counted once.</p>")
-        out += table(["GPU", "Spot, latest weekly median $/GPU-hour", "Spot as % of on-demand", "Spot, 13 weeks",
-                      "Worst 13-week change in spot", "Reserved for 12 months"], spot_rows)
+        out += ("<h4>Spot and reserved prices</h4>"
+                '<p class="muted">Spot capacity is rented by the hour with no commitment, and the provider can '
+                "take it back at any time. It is the capacity a provider has not sold any other way. Reserved "
+                "capacity is committed for a year. All prices are weekly medians with each provider counted "
+                "once.</p>")
+        out += table(["GPU", "Latest weekly spot median, $ per hour", "Spot as % of on-demand",
+                      "Spot change over 13 weeks", "Worst 13-week change in spot", "Reserved for 12 months"], spot_rows)
         compared = len(spot_rows) - len(spot_thin)
         out += line(
             f"the {GPU_AVG_WEEKS}-week average spot price of any of these GPUs falls {GPU_SPOT_DROP_13W_PCT}% or "
-            "more over 13 weeks. Spot is where unsold capacity shows up first, and it is the price "
-            f'<a href="{HEMPTON_URL}">John Hempton</a>\'s argument turns on: compute has a high capital '
-            "cost and a low marginal cost and one provider's is much like another's, so once there is more "
-            "of it than buyers want, its price falls towards the cost of running it. He says the world is "
-            '"very, very short" of compute now and expects that to end within two years at the rate it is '
-            f"being built. Weeks with fewer than {GPU_SPOT_MIN_SELLERS} spot sellers aren't compared, because "
-            "a median of so few says little"
-            + (f"; since {GPU_START:%b %-d, %Y} the worst 13-week changes were: {', '.join(spot_worst)}." if spot_worst else "."),
+            "more over 13 weeks. Unsold capacity shows up first in spot prices. "
+            f'<a href="{HEMPTON_URL}">John Hempton</a> argues that computing power costs a lot to build and '
+            "little to run, and that one provider's is much like another's, so once there is more of it than "
+            "buyers want, its price falls towards the cost of running it. He says the world is \"very, very "
+            "short\" of computing power now and expects that to end within two years at the rate it is being "
+            f"built. Weeks with fewer than {GPU_SPOT_MIN_SELLERS} spot sellers are not compared."
+            + (f" Since {day(GPU_START)}, the worst 13-week changes in spot prices were {and_list(spot_worst)}."
+               if spot_worst else ""),
             True if spot_crossed else (False if compared else None),
-            (f"Down {GPU_SPOT_DROP_13W_PCT}% or more over 13 weeks: {', '.join(spot_crossed)}." if spot_crossed else "")
-            + (f" Too few spot sellers to compare {', '.join(spot_thin)}"
-               + (", so check by hand." if not compared else ".") if spot_thin else ""))
+            (f"The spot price fell {GPU_SPOT_DROP_13W_PCT}% or more over 13 weeks for {and_list(spot_crossed)}."
+             if spot_crossed else "")
+            + (f" There are too few spot sellers to compare {and_list(spot_thin)}." if spot_thin else ""))
     return out + (
-        '<p class="muted">Source: <a href="https://getdeploying.com/dataset/gpu-prices">'
-        "GetDeploying, GPU rental price history</a>, "
-        '<a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. Weekly median '
-        "advertised price across cloud providers (on demand, spot and reserved), each provider counted "
-        "once; the current week is left out until it is complete. Changes use 4-week averages from "
-        f"{GPU_START:%b %-d, %Y}, when the series switched from hand-entered to automated prices.</p>")
+        '<p class="muted">Source: <a href="https://getdeploying.com/dataset/gpu-prices">GetDeploying\'s GPU '
+        'rental price history</a>, published under the <a href="https://creativecommons.org/licenses/by/4.0/">'
+        "CC BY 4.0</a> license. It gives the weekly median advertised price across cloud providers for renting "
+        "on demand, on the spot market and by reservation, with each provider counted once. The current week "
+        "is left out until it is complete. Changes use 4-week averages from "
+        f"{day(GPU_START)}, when the source switched from prices entered by hand to prices collected "
+        "automatically.</p>")
 
 
 # ---------- size of the build-out ----------
@@ -1279,8 +1301,8 @@ def block_gpu_prices():
 # the national accounts (BEA, via FRED), back to 1990 so that the telecom boom is on the same chart.
 
 BUILDOUT = [  # FRED series, what it is, short name for the chart
-    ("A679RC1Q027SBEA", "Information processing equipment and software", "All tech"),
-    ("B935RC1Q027SBEA", "Of which computers and peripheral equipment", "Computers"),
+    ("A679RC1Q027SBEA", "Computers, communications equipment and software", "Total"),
+    ("B935RC1Q027SBEA", "Computers and their peripherals alone", "Computers"),
 ]
 BUILDOUT_FROM = "1990-01-01"
 BUILDOUT_STALE_DAYS = 250  # a quarter is first estimated a month after it ends and stays the newest for three more
@@ -1319,53 +1341,55 @@ def block_buildout():
         return pts
 
     rows, lines, missing, verdict, detail, history, notes = [], [], [], None, "", "", ""
-    fetched = per_item(BUILDOUT, lambda it: f"{it[1]} (FRED {it[0]})", share)
+    fetched = per_item(BUILDOUT, lambda it: f"FRED series {it[0]}", share)
     for i, ((sid, name, short), pts, err) in enumerate(fetched):
         if err:
             missing.append(name)
-            rows.append([esc(name), f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a", "n/a"])
+            rows.append([esc(name), not_available(err), "n/a", "n/a", "n/a"])
             continue
         d, v = pts[-1]
         if (TODAY - date.fromisoformat(d)).days > BUILDOUT_STALE_DAYS:
-            warn(f"{name}: the newest FRED value is for {quarter_name(d)}")
+            warn(f"The newest FRED figure for {name.lower()} is for {quarter_name(d)}.")
             notes = f" The newest figures are for {quarter_name(d)}, which is unusually old."
         boom = max((p for p in pts if "1995" <= p[0] < "2003"), key=lambda p: p[1], default=None)
-        rows.append([esc(name), f"{v:.2f}% ({quarter_name(d)})", f"{pts[-5][1]:.2f}%",
-                     f"{boom[1]:.2f}% ({quarter_name(boom[0])})" if boom else "n/a",
+        rows.append([esc(name), f"{v:.2f}% in {quarter_name(d)}", f"{pts[-5][1]:.2f}%",
+                     f"{boom[1]:.2f}% in {quarter_name(boom[0])}" if boom else "n/a",
                      f"{v - boom[1]:+.2f} points" if boom else "n/a"])
         lines.append((short, SERIES[i], pts))
         if i == 0:  # the line is drawn on the broad measure
             high = max(pts[-9:], key=lambda p: p[1])
             verdict = high[1] - v >= BUILDOUT_DROP_PTS
-            detail = (f"{v:.2f}% of GDP in {quarter_name(d)}, " + ("its high of the last two years."
-                      if high[0] == d else f"{high[1] - v:.2f} points below its high of the last two years "
-                      f"({high[1]:.2f}% in {quarter_name(high[0])})."))
+            detail = (f"Investment was {v:.2f}% of GDP in {quarter_name(d)}, " + ("the highest of the last two years."
+                      if high[0] == d else f"{high[1] - v:.2f} points below the high of the last two years, "
+                      f"{high[1]:.2f}% in {quarter_name(high[0])}."))
             past = [e for e in drop_episodes(pts, BUILDOUT_DROP_PTS) if e[1] != d]
-            times = {0: "never", 1: "only once", 2: "only twice"}.get(len(past), f"{len(past)} times")
-            history = (f" Since {date.fromisoformat(pts[8][0]).year} that has happened {times} before"
-                       + (": " + "; ".join(f"{quarter_name(a)} to {quarter_name(b)} (as much as {x:.2f} points below)"
-                                           for a, b, x in past) if past else "") + ".")
+            since = date.fromisoformat(pts[8][0]).year
+            times = {1: "once", 2: "twice"}.get(len(past), f"{len(past)} times")
+            history = (f" Since {since} this has never happened." if not past else
+                       f" Since {since} this has happened {times}, "
+                       + and_list(f"from {quarter_name(a)} to {quarter_name(b)}" for a, b, _ in past)
+                       + f". The deepest fall was {max(x for *_, x in past):.2f} points.")
     fmt = lambda v, tick=False: f"{v:.0f}%" if tick else f"{v:.1f}%"
     out = legend([(n, c) for n, c, _ in lines])
-    out += ('<p class="muted">US private investment in computers, communications equipment and software as a '
-            "share of GDP, quarterly, from 1990 so that the late-1990s boom is on the chart. Hover a line "
-            "for the quarter and value.</p>")
-    aria = "US investment in information processing equipment and software as a share of GDP since 1990"
+    out += ('<p class="muted">Private investment in computers, communications equipment and software in the '
+            "United States as a share of GDP, each quarter since 1990, so that the boom of the late 1990s is on "
+            "the chart. Hover over a line to see the quarter and value.</p>")
+    aria = "US investment in computers, communications equipment and software as a share of GDP since 1990"
     out += (f'<div class="wide">{line_chart(lines, fmt, years=5, when=quarter_name, aria=aria)}</div>'
             f'<div class="narrow">{line_chart(lines, fmt, w=380, h=260, years=10, when=quarter_name, aria=aria)}</div>')
-    out += table(["Private investment, % of GDP", "Latest", "A year earlier", "Peak of the 1990s boom",
-                  "Now vs that peak"], rows)
+    out += table(["Private investment as % of GDP", "Latest", "A year earlier", "Peak of the 1990s boom",
+                  "Change since that peak"], rows)
     out += line(
-        "investment in information processing equipment and software is "
-        f"{BUILDOUT_DROP_PTS} points of GDP or more below its high of the last two years: the build-out "
-        f"itself has turned down.{history} "
-        f'<a href="{HEMPTON_URL}">John Hempton</a>\'s comparison is the fiber-optic boom, which changed '
-        'the world while "more or less every penny that was ever invested in fiber optics went to zero"; '
-        "the chart shows how today's spending compares with that boom. These are whole-economy figures, "
-        "so they move slowly, include ordinary office IT and leave out the buildings and power plants: "
-        "like the bond spreads, they confirm a turn more than they predict one.",
+        "investment in computers, communications equipment and software falls "
+        f"{BUILDOUT_DROP_PTS} points of GDP or more below its high of the last two years, which would mean "
+        f"the build-out itself has turned down.{history} "
+        f'<a href="{HEMPTON_URL}">John Hempton</a> compares the AI boom with the fiber optic boom, which '
+        'changed the world although "more or less every penny that was ever invested in fiber optics went '
+        'to zero". These figures cover the whole economy, so they move slowly, include ordinary office '
+        "equipment and leave out buildings and power plants. Like the bond spreads, they confirm a downturn "
+        "more than they predict one.",
         verdict, (detail or unavailable(missing[:1])) + notes)
-    return out + source("US Bureau of Economic Analysis national accounts via FRED",
+    return out + source("US Bureau of Economic Analysis national accounts, via FRED",
                         "https://fred.stlouisfed.org/series/A679RC1Q027SBEA")
 
 
@@ -1461,58 +1485,59 @@ def block_adoption():
     last_day, latest = use[-1]
     old = (TODAY - date.fromisoformat(last_day)).days > BTOS_STALE_DAYS
     if old:
-        warn(f"Businesses using AI: the newest survey ended {last_day}")
+        warn(f"The newest survey of businesses using AI ended on {day(last_day)}.")
     lines = [("Now", SERIES[0], use)] + ([("Expected", SERIES[1], soon)] if len(soon) > 1 else [])
     fmt = lambda v, tick=False: f"{v:.0f}%" if tick else f"{v:.1f}%"
     when = lambda d: f"survey ending {d}"
     out = legend([("Used AI in the last two weeks", SERIES[0])]
                  + ([("Expect to be using AI in six months", SERIES[1])] if len(soon) > 1 else []))
-    out += ('<p class="muted">Share of US businesses answering yes, one point per two-week survey; vertical '
-            "lines mark the start of each month. Hover a line for the survey and value.</p>")
+    out += ('<p class="muted">The share of US businesses answering yes in each two-week survey. Vertical '
+            "lines mark the start of each month. Hover over a line to see the survey and value.</p>")
     aria = "Share of US businesses using AI, by survey"
     out += (f'<div class="wide">{line_chart(lines, fmt, when=when, aria=aria)}</div>'
             f'<div class="narrow">{line_chart(lines, fmt, w=380, h=260, label_every=3, when=when, aria=aria)}</div>')
     back = lambda pts: f"{pts[-1 - ADOPTION_BACK][1]:.1f}%" if len(pts) > ADOPTION_BACK else "n/a"
-    rows = [["Used AI in the last two weeks", f"{latest:.1f}% (survey ending {esc(last_day)})", back(use),
-             f"{use[0][1]:.1f}% ({esc(use[0][0])})"]]
+    rows = [["Used AI in the last two weeks", f"{latest:.1f}% in the survey ending {esc(last_day)}", back(use),
+             f"{use[0][1]:.1f}% on {esc(use[0][0])}"]]
     if len(soon) > 1:
-        rows.append(["Expect to be using AI in six months", f"{soon[-1][1]:.1f}% (survey ending {esc(soon[-1][0])})",
-                     back(soon), f"{soon[0][1]:.1f}% ({esc(soon[0][0])})"])
-    out += table(["Share of US businesses", "Latest", f"{ADOPTION_BACK} surveys (about three months) earlier",
+        rows.append(["Expect to be using AI in six months", f"{soon[-1][1]:.1f}% in the survey ending {esc(soon[-1][0])}",
+                     back(soon), f"{soon[0][1]:.1f}% on {esc(soon[0][0])}"])
+    out += table(["Share of US businesses", "Latest", f"{ADOPTION_BACK} surveys or about three months earlier",
                   "First survey with this question"], rows)
     crossed, detail = None, ""
     if old:
-        detail = f"The newest survey ended {last_day}, which is unusually old, so check by hand."
+        detail = f"The newest survey ended on {day(last_day)}, which is unusually old."
     elif len(use) < ADOPTION_BACK + 3:
-        detail = "Too few surveys so far, so check by hand."
+        detail = "There have been too few surveys so far."
     else:
         now = st.mean(v for _, v in use[-3:])
         then = st.mean(v for _, v in use[-3 - ADOPTION_BACK:-ADOPTION_BACK])
         crossed = now <= then
-        detail = (f"Average of the last three surveys (to {last_day}): {now:.1f}%; of the three ending "
-                  f"{use[-1 - ADOPTION_BACK][0]}: {then:.1f}%.")
+        detail = (f"The last three surveys, up to {day(last_day)}, averaged {now:.1f}%. The three ending on "
+                  f"{day(use[-1 - ADOPTION_BACK][0])} averaged {then:.1f}%.")
     out += line(
-        "the share of businesses using AI stops rising: the average of the last three surveys is no higher "
-        f"than the average of the three surveys {ADOPTION_BACK} surveys (about three months) earlier. "
-        f'<a href="{HEMPTON_URL}">John Hempton</a> thinks the spending can only pay for itself by '
-        "replacing a large part of the wage bill, and doubts AI can get into businesses fast enough: "
-        "it does a job only after the people who do that job have taught it how, and they have little "
-        "reason to. If adoption flattens while capex keeps climbing, the revenue isn't coming.",
+        "the share of businesses using AI stops rising, which means that the last three surveys average no "
+        "more than three surveys about three months earlier. "
+        f'<a href="{HEMPTON_URL}">John Hempton</a> thinks the spending can only pay for itself by replacing '
+        "a large part of the wage bill. He doubts that AI can spread through businesses fast enough, because "
+        "it can take over a job only after the people who do that job have taught it how, and they have "
+        "little reason to. If the use of AI stops growing while spending keeps climbing, the revenue is not "
+        "coming.",
         crossed, detail)
     headcount = {a: v for (q, a), v in answers.items() if BTOS_HEADCOUNT.search(q)}
     surveys = sorted(s for s in headcount.get("Decreased", {}) if s in headcount.get("Increased", {}) and s in ends)
     jobs = ""
     if surveys:
         s = surveys[-1]
-        jobs = (f" In the survey ending {ends[s].isoformat()}, {headcount['Decreased'][s]:.1f}% of the businesses "
-                f"answering said that using AI had reduced their headcount over the last six months and "
-                f"{headcount['Increased'][s]:.1f}% that it had increased it.")
-    out += ('<p class="muted">The Census Bureau surveys a rotating panel of US businesses every two weeks, so '
-            "single surveys wobble; the line compares three-survey averages."
-            + (f" The question as now worded: “{esc(question.split('?')[0])}?” A change of wording can move "
-               "the answers." if question else "")
+        jobs = (f" In the survey ending on {day(ends[s])}, {headcount['Decreased'][s]:.1f}% of businesses said that "
+                "using AI had reduced their number of employees over the last six months, and "
+                f"{headcount['Increased'][s]:.1f}% said that it had increased it.")
+    out += ('<p class="muted">The Census Bureau asks a rotating panel of US businesses every two weeks, so single '
+            "surveys wobble, and the line compares averages of three surveys."
+            + (f" The question now reads “{esc(question.split('?')[0])}?” A change of wording can move the "
+               "answers." if question else "")
             + jobs + "</p>")
-    return out + source("US Census Bureau, Business Trends and Outlook Survey (national estimates)",
+    return out + source("US Census Bureau, Business Trends and Outlook Survey, national estimates",
                         "https://www.census.gov/hfp/btos/data_downloads")
 
 
@@ -1539,48 +1564,47 @@ def spread_episodes(rows, limit):
 
 def describe_episodes(name, limit, first, episodes):
     if not episodes:
-        return f"Since {first:%b %Y}, {name} have not been {limit}bp above their 1-year low."
-    spans = "; ".join(f"{a:%b %-d, %Y}" + ("" if a == b else f" – {b:%b %-d, %Y}") + f" (peak +{p:.0f}bp)"
-                      for a, b, p in episodes)
-    times = "once" if len(episodes) == 1 else f"{len(episodes)} times"
-    return f"Since {first:%b %Y}, {name} crossed their line {times}: {spans}."
+        return f"Since {first:%B %Y}, {name} have never been {limit}bp above their low of the year before."
+    spans = and_list(f"on {day(a)}" if a == b else f"from {day(a)} to {day(b)}" for a, b, _ in episodes)
+    times = {1: "once", 2: "twice"}.get(len(episodes), f"{len(episodes)} times")
+    return (f"Since {first:%B %Y}, {name} have reached their line {times}, {spans}, and rose as much as "
+            f"{max(p for *_, p in episodes):.0f}bp above their low.")
 
 
 def block_spreads():
     out_rows, crossed, history, missing = [], [], [], []
-    series = [("BAMLC0A4CBBB", "BBB corporate (lowest investment grade)", "BBB spreads", BBB_WIDENING_BP),
-              ("BAMLH0A0HYM2", "High yield", "high-yield spreads", HY_WIDENING_BP)]
-    for (series_id, name, short, limit), rows, err in per_item(series, lambda it: f"{it[1]} spread",
+    series = [("BAMLC0A4CBBB", "BBB corporate bonds, the lowest investment grade", "BBB spreads", BBB_WIDENING_BP),
+              ("BAMLH0A0HYM2", "High-yield corporate bonds", "high-yield spreads", HY_WIDENING_BP)]
+    for (series_id, name, short, limit), rows, err in per_item(series, lambda it: f"the {it[2][:-1]} series",
                                                                lambda it: fred_series(it[0])):
         if err:
-            missing.append(name)
-            out_rows.append([name, f'<span class="error">unavailable today: {esc(err)}</span>', "n/a", "n/a",
-                             "n/a", f"+{limit}bp"])
+            missing.append(short)
+            out_rows.append([name, not_available(err), "n/a", "n/a", "n/a", f"+{limit}bp"])
             continue
         history.append(describe_episodes(short, limit, *spread_episodes(rows, limit)))
         d, latest = rows[-1]
         if (TODAY - date.fromisoformat(d)).days > 6:
-            warn(f"{name} spread: the newest FRED value is for {d}")
+            warn(f"The newest FRED figure for {short} is for {day(d)}.")
         year_ago = (date.fromisoformat(d) - timedelta(days=365)).isoformat()
         low_d, low = min(((x, v) for x, v in rows if x >= year_ago), key=lambda p: p[1])
         month_ago = [v for x, v in rows
                      if x <= (date.fromisoformat(d) - timedelta(days=30)).isoformat()][-1]
         above = latest - low
         if above >= limit:
-            crossed.append(name)
+            crossed.append(short)
         widening = f"+{above:.0f}bp"
-        out_rows.append([name, f"{latest:.0f}bp ({esc(d)})", f"{month_ago:.0f}bp",
-                         f"{low:.0f}bp ({esc(low_d)})",
+        out_rows.append([name, f"{latest:.0f}bp on {esc(d)}", f"{month_ago:.0f}bp",
+                         f"{low:.0f}bp on {esc(low_d)}",
                          f'<span class="bad">{widening}</span>' if above >= limit else widening,
                          f"+{limit}bp"])
-    out = table(["Spread over Treasuries", "Latest", "30 days ago", "1-year low",
-                 "Above 1-year low", "Worry line"], out_rows)
+    out = table(["Spread over Treasury bonds", "Latest", "30 days earlier", "Lowest in the last year",
+                 "Above that low", "Warning line"], out_rows)
     out += line(
-        f"BBB spreads are {BBB_WIDENING_BP}bp or more above their 1-year low, or high-yield "
-        f"spreads {HY_WIDENING_BP}bp or more. {' '.join(history)} "
-        "These cover the whole market, not just AI debt, so they confirm stress more than predict it.",
+        f"BBB spreads rise {BBB_WIDENING_BP}bp or more above their lowest level of the past year, or high-yield "
+        f"spreads rise {HY_WIDENING_BP}bp or more above theirs. {' '.join(history)} These spreads cover all "
+        "corporate bonds, so they confirm stress more than they predict it.",
         True if crossed else (None if missing else False),
-        (f"At or past the line: {', '.join(crossed)}." if crossed else "") + unavailable(missing))
+        (f"{and_list(crossed)[0].upper()}{and_list(crossed)[1:]} have reached the line." if crossed else "") + unavailable(missing))
     return out + source("ICE BofA option-adjusted spreads via FRED",
                         "https://fred.stlouisfed.org/series/BAMLC0A4CBBB")
 
@@ -1708,41 +1732,42 @@ def block_cds():
     top = cds_signal.nice_pd_max(peak)
     out = ('<p class="legend">'
            '<span class="key" style="background:#2a78d6;border:2px solid #2a78d6;width:6px;height:6px;border-radius:50%"></span>'
-           'Estimate from CDS trades (DTCC), monthly median; bar = 90% interval; faded = fewer than 3 trading days '
+           'Monthly estimate from trades, with a bar for the 90% interval. Faded dots had fewer than three days of trading. '
            '<span class="key" style="background:#2a78d6;opacity:.25;width:8px;height:14px;border-radius:4px"></span>'
-           'month where the trade data can\'t tell who paid the up-front (both readings shown) '
+           'A month in which the data cannot tell who paid the up-front payment, with both readings shown. '
            '<span class="key" style="background:#eb6834;width:9px;height:9px;transform:rotate(45deg);border-radius:1px"></span>'
-           'level reported in the news '
+           'A level reported in the news. '
            '<span class="key" style="background:#8f8d87;height:2px"></span>'
-           'stock price, daily close (left axis, log scale)</p>'
-           '<p class="muted">Right axis: 5-year default probability, one scale for all three companies. Hover a '
-           'point for details and sources.</p>')
+           'The share price at each day\'s close, on the left axis with a log scale.</p>'
+           '<p class="muted">The right axis is the probability of default within five years, on one scale for '
+           'all three companies. Hover over a point for details and sources.</p>')
     rows, gaps = [], []
     for ticker, name in CDS_NAMES:
         try:
             closes = [(date.fromisoformat(d), c) for d, c in yahoo_closes(ticker, "2y")]
             note = ""
         except Exception as e:
-            closes, note = [], f'<p class="error">Stock price unavailable today: {esc(short_error(e))}</p>'
+            closes, note = [], f'<p class="error">The share price could not be read today ({esc(short_error(e))}).</p>'
         series, by_rec, pts = data[ticker]
         marks = []
         for r in reported[ticker]:
             mine, n = cds_signal.estimate_near(pts, r["date"])
-            check = (f"; trade-based estimate {mine:,.0f}bp from {n} trade{'s' * (n != 1)} in the days before"
+            check = (f" The estimate from {n} trade{'s' * (n != 1)} in the days before was {mine:,.0f}bp."
                      if mine else "")
             if mine and r["out_of_sample"] and start <= r["date"] <= today:
                 gaps.append(abs(mine / r["bp"] - 1))
             note_text = f" ({r['note']})" if r.get("note") and r["note"] != r.get("title") else ""
             marks.append((r["date"], to_pd(r["bp"] / 1e4),
-                          f"{r['source']}, {r['date']:%b %-d, %Y}: 5-year CDS {r['bp']:,.0f}bp{note_text} "
-                          f"= {pct_text(to_pd(r['bp'] / 1e4))} on this page's assumptions{check}"))
+                          f"{r['source']} reported a five-year CDS spread of {r['bp']:,.0f}bp on {day(r['date'])}"
+                          f"{note_text}. On this page's assumptions that is a {pct_text(to_pd(r['bp'] / 1e4))} "
+                          f"chance of default.{check}"))
         out += (f"<h4>{esc(name)} ({ticker})</h4>"
                 + cds_signal.svg_chart(ticker, series, closes, start, today, top, marks) + note)
         have = [s for s in series if s.median is not None]
         latest_news = max(reported[ticker], key=lambda r: r["date"], default=None)
         news_cell = (f'<a href="{esc(latest_news["url"])}">{latest_news["bp"]:,.0f}bp</a> on '
-                     f'{latest_news["date"]:%b %-d} ({esc(latest_news["source"])}) = {pct_text(to_pd(latest_news["bp"] / 1e4))}'
-                     if latest_news else "none found")
+                     f'{latest_news["date"]:%b %-d} from {esc(latest_news["source"])}, which is '
+                     f'{pct_text(to_pd(latest_news["bp"] / 1e4))}' if latest_news else "none found")
         if not have:
             rows.append([f"{esc(name)} ({ticker})", "no trades", "n/a", "n/a", "n/a", news_cell, "0"])
             continue
@@ -1751,45 +1776,50 @@ def block_cds():
                   else f"{s.month:%b %Y}")
         bp = lambda p: cds_signal.par_spread(-math.log(1 - p) / cds_signal.HORIZON) * 1e4
         if s.unresolved:
-            est = f"{pct_text(s.alt)} or {pct_text(s.median)} (who paid isn't settled)"
+            est = f"{pct_text(s.alt)} or {pct_text(s.median)}, depending on who paid"
             spread = f"{bp(s.alt):,.0f} or {bp(s.median):,.0f}bp"
             rec = "n/a"
         else:
-            est = f"{pct_text(s.median)} ({pct_text(s.lo)}–{pct_text(s.hi)})"
+            est = (pct_text(s.median) if pct_text(s.lo) == pct_text(s.hi)
+                   else f"{pct_text(s.median)}, from {pct_text(s.lo)} to {pct_text(s.hi)}")
             spread = f"{bp(s.median):,.0f}bp"
             rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
-            rec = f"{pct_text(rec_lo)}–{pct_text(rec_hi)}" if rec_lo is not None and rec_hi is not None else "n/a"
+            rec = f"{pct_text(rec_lo)} to {pct_text(rec_hi)}" if rec_lo is not None and rec_hi is not None else "n/a"
         rows.append([f"{esc(name)} ({ticker})", period, est, spread, rec, news_cell, f"{s.n} on {s.days} days"])
     rec_lo, rec_hi = (f"{r:.0%}" for r in cds_signal.RECOVERY_RANGE)
-    out += table(["Company", "Latest month", "5-year default probability (90% interval)", "≈ 5-year spread",
-                  f"At {rec_lo}–{rec_hi} recovery", "Latest level in the news", "Trades"], rows)
-    accuracy = (f"Against the {len(gaps)} reported levels that were not used to build the method and have trades "
-                f"in the days before them, the trade-based estimate differs by a median of {st.median(gaps) * 100:.0f}% "
-                f"(at most {max(gaps) * 100:.0f}%). " if gaps else "")
+    out += table(["Company", "Latest month", "Chance of default within five years, with 90% interval",
+                  "Equivalent five-year spread", f"With {rec_lo} to {rec_hi} recovered", "Latest level in the news",
+                  "Trades"], rows)
+    accuracy = (f"For the {len(gaps)} reported levels that were not used to build the method and that have trades "
+                f"in the days before them, the estimate from trades differs by a median of "
+                f"{st.median(gaps) * 100:.0f}% and at most {max(gaps) * 100:.0f}%. " if gaps else "")
     out += no_line(
-        "This is the 5-year default probability implied by what credit default swap buyers pay for "
-        "protection against the company failing to pay its debts or going bankrupt (including on debt "
-        "it guarantees; a restructuring or an out-of-court debt exchange generally doesn't count, nor "
-        "does a default by a subsidiary whose debt it doesn't guarantee). It is a market price, not a "
-        "forecast: it includes a premium for bearing the risk, so the real-world odds are likely lower, "
-        f"and it assumes lenders recover {cds_signal.R:.0%} in a default (the recovery column shows "
-        f"{rec_lo} and {rec_hi}; lower recovery means a lower probability for the same price). " + accuracy +
-        "Worry when it climbs for several months in a row, and most when CoreWeave and Oracle climb "
-        "together while Nvidia stays flat, which points to the AI financing chain rather than chip demand.")
+        "This is the chance that the company defaults within five years, implied by what buyers of credit "
+        "default swaps pay for protection. A default here means failing to pay its debts or going bankrupt, "
+        "including on debt it guarantees. A restructuring or a debt exchange agreed out of court generally "
+        "does not count, and neither does a default by a subsidiary whose debt it does not guarantee. The "
+        "figure is a market price that includes a premium for bearing the risk, so the real chance is "
+        f"probably lower. It assumes that lenders recover {cds_signal.R:.0%} of what they are owed. The "
+        f"recovery column shows {rec_lo} and {rec_hi}, and a lower recovery gives a lower chance for the same "
+        "price. " + accuracy +
+        "Worry when it climbs for several months in a row, and most of all when CoreWeave and Oracle climb "
+        "together while Nvidia stays flat. That would point to trouble in how AI is financed while demand "
+        "for chips holds up.")
     if problem:
         out += f'<p class="error">{esc(problem)}</p>'
     return out + (
-        '<p class="muted">Source: <a href="https://pddata.dtcc.com/ppd/secdashboard">DTCC public '
-        "security-based swap data</a> (SEC Regulation SBSR), reported levels from the press as linked, and "
-        "Yahoo Finance daily closes. The estimate uses US-dollar standard-coupon trades on each company's "
-        "own credit with 4.5–5.5 years left; legs of credit-index trades, novations, modifications and "
-        "unwind fees are left out, as are single prints far out of line with the trades around them. "
-        "A trade prices from its quoted spread or from its up-front payment and exact size. DTCC reports "
-        "the up-front as net cash, after the accrued coupon the seller hands back, without saying who paid "
-        "it; that is settled by quoted spreads and by how prices behave across quarterly coupon dates, and "
-        "where the data don't settle it both readings are shown. Some spreads are reported 100 times too "
-        f"small; these are scaled up only when they match properly reported quotes within {cds_signal.RESCALE_DAYS} "
-        "days. Reported levels are converted to probabilities with the same assumptions. Method and checks: "
+        '<p class="muted">Sources: <a href="https://pddata.dtcc.com/ppd/secdashboard">DTCC\'s public data '
+        "on security-based swaps</a>, which it publishes under SEC Regulation SBSR, the press reports linked "
+        "on each chart, and daily closing prices from Yahoo Finance. The estimate uses trades in US dollars at "
+        "the standard coupon on each company's own debt, with 4.5 to 5.5 years left to run. It leaves out the "
+        "parts of trades on credit indexes, transfers and changes of existing trades, fees for ending trades "
+        "early, and single trades far out of line with those around them. A trade is priced from its quoted "
+        "spread, or from its up-front payment and exact size. DTCC reports the up-front payment as net cash, "
+        "after the accrued coupon that the seller hands back, and does not say who paid it. Quoted spreads and "
+        "the way prices behave around the quarterly coupon dates usually settle this, and where they do not, "
+        "both readings are shown. Some spreads are reported 100 times too small, and these are scaled up only "
+        f"when they match properly reported quotes within {cds_signal.RESCALE_DAYS} days. Reported levels are "
+        "turned into probabilities with the same assumptions. The method and its checks are described in "
         "cds/CDS_VALIDATION.md in the project.</p>")
 
 
@@ -1797,13 +1827,12 @@ def block_weak_borrowers():
     rows, row_of, moves, ends, missing = [], {}, {}, {}, []
     landlords = dict(LANDLORDS)
     tickers = WEAK_BORROWERS + ["QQQ"] + list(landlords)
-    for ticker, series, err in per_item(tickers, lambda t: f"{t} stock price", yahoo_closes):
-        label = ("QQQ (Nasdaq-100, for comparison)" if ticker == "QQQ"
-                 else f"{ticker} ({landlords[ticker]}, a landlord, for comparison)" if ticker in landlords else ticker)
+    for ticker, series, err in per_item(tickers, lambda t: f"the {t} share price", yahoo_closes):
+        label = ("QQQ, the Nasdaq-100, for comparison" if ticker == "QQQ"
+                 else f"{ticker}, {landlords[ticker]}, a landlord, for comparison" if ticker in landlords else ticker)
         if err or not series:
             missing.append(ticker)
-            rows.append([label, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>',
-                         "n/a", "n/a", "n/a"])
+            rows.append([label, not_available(err), "n/a", "n/a", "n/a"])
             continue
         closes = [c for _, c in series]
         last, ends[ticker] = closes[-1], series[-1][0]
@@ -1816,9 +1845,9 @@ def block_weak_borrowers():
     last_day = max(ends.values())
     for ticker, row in row_of.items():
         if ends[ticker] < last_day:  # from an older saved copy: its own date, and not compared with the rest
-            row[1] += f' <span class="error">(close of {esc(ends[ticker])})</span>'
+            row[1] += f' <span class="error">from the close of {esc(ends[ticker])}</span>'
             moves[ticker] = None
-    out = table(["Ticker", f"Close ({esc(last_day)})", "1 month", "3 months", "From 52-week high"], rows)
+    out = table(["Ticker", f"Close on {esc(last_day)}", "1 month", "3 months", "From 52-week high"], rows)
     group = [t for t in WEAK_BORROWERS if t != "ORCL"]
     # Every one of the six and QQQ is needed: an average over fewer can't say the line wasn't reached.
     lacking = [t for t in group + ["QQQ"] if moves.get(t) is None]
@@ -1828,39 +1857,40 @@ def block_weak_borrowers():
     crossed = (None if lacking
                else basket <= -WEAK_BASKET_PCT and len(fell) >= 4 and qqq > -QQQ_CALM_PCT)
     out += line(
-        f"the former bitcoin miners and CoreWeave fall together while the market holds up: over a "
-        f"month, the six ({', '.join(group)}) are down {WEAK_BASKET_PCT}% or more on average, at least "
-        f"four of them by {WEAK_EACH_PCT}% or more, while QQQ is down less than {QQQ_CALM_PCT}%. Ares "
-        "profiles these miners as having gone \"from bitcoin miner to investment grade issuer in three "
-        "years (or less)\", and CoreWeave as one of the largest borrowers in GPU financing; Oracle is "
-        "shown for comparison. Their stocks are a free stand-in for their bond prices, which usually "
-        "move first but aren't freely available, and they routinely swing 50% or more without any "
-        "credit event. A fall that comes with news of a pulled bond deal, a downgrade or a covenant "
-        "problem (see the headlines below) matters more.",
-        crossed, (f"Over the last month: the six {basket:+.1f}% on average, {len(fell)} down "
-                  f"{WEAK_EACH_PCT}% or more, QQQ {qqq:+.1f}%." if crossed is not None
-                  else f"No one-month change today for {', '.join(lacking)}, so check by hand."))
+        f"the six most heavily indebted of these, {and_list(group)}, fall together while the market holds up. "
+        f"That means that over a month the six are down {WEAK_BASKET_PCT}% or more on average, at least four "
+        f"of them by {WEAK_EACH_PCT}% or more, while QQQ is down less than {QQQ_CALM_PCT}%. Ares describes the "
+        "former bitcoin miners among them as having gone \"from bitcoin miner to investment grade issuer in "
+        "three years (or less)\", and CoreWeave as one of the largest borrowers against GPUs. Oracle is shown "
+        "for comparison. Their shares stand in for their bonds, which usually move first but whose prices are "
+        "not freely available. The shares often swing by 50% or more with no trouble with their debt at all. "
+        "A fall that comes with news of a pulled bond sale, a downgrade or a broken loan condition matters "
+        "more, and the news section below watches for these.",
+        crossed, (f"Over the last month the six moved {basket:+.1f}% on average, {len(fell)} of them were down "
+                  f"{WEAK_EACH_PCT}% or more, and QQQ moved {qqq:+.1f}%." if crossed is not None
+                  else f"There is no one-month change today for {and_list(lacking)}."))
     # The same fall measured against the landlords, who own buildings and power but not the chips.
     rented = [moves[t] for t in landlords if moves.get(t) is not None]
     land = st.mean(rented) if len(rented) == len(landlords) else None
     apart = None if basket is None or land is None else basket <= -WEAK_BASKET_PCT and land > -QQQ_CALM_PCT
     names = " and ".join(landlords.values())
     out += line(
-        f"the six fall while the landlords hold: over a month the six are down {WEAK_BASKET_PCT}% or more "
-        f"on average while {names} are down less than {QQQ_CALM_PCT}% on average. {names} rent out "
-        "buildings, power and cooling but don't own the chips inside. "
-        f'<a href="{HEMPTON_URL}">John Hempton</a>\'s view is that a much better chip makes every existing '
-        'one obsolete, which hurts whoever owns the chips, while the landlords "might be fine". When the '
-        "two groups part like this, the market is selling the chips and their debt, not data centers as "
-        "such. The miners' shares also follow the price of bitcoin, so check that before reading much "
-        "into it.",
-        apart, (f"Over the last month: the six {basket:+.1f}% on average, the landlords {land:+.1f}%."
-                if apart is not None else "No one-month change today for some of these, so check by hand."))
-    return out + source("Yahoo Finance daily closes", "https://finance.yahoo.com/")
+        f"the six fall while the landlords hold, which means that over a month the six are down "
+        f"{WEAK_BASKET_PCT}% or more on average while {names} are down less than {QQQ_CALM_PCT}% on average. "
+        f"{names} rent out buildings, power and cooling, and do not own the chips inside. "
+        f'<a href="{HEMPTON_URL}">John Hempton</a> expects a much better chip to make every existing one '
+        'obsolete, which would hurt the owners of chips, while the landlords "might be fine". When the two '
+        "groups move apart like this, the market is selling the chips and the debt behind them and leaving "
+        "the buildings alone. The miners' shares also follow the price of bitcoin, so check that before "
+        "reading much into it.",
+        apart, (f"Over the last month the six moved {basket:+.1f}% on average and the landlords {land:+.1f}%."
+                if apart is not None else "Some of the one-month changes could not be worked out today."))
+    return out + source("Yahoo Finance daily closing prices", "https://finance.yahoo.com/")
+
 
 
 HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why it matters
-    ("A", "Hyperscalers pulling back",
+    ("A", "News of cloud companies pulling back from data centers",
      ['(Microsoft OR Google OR Amazon OR Meta OR Oracle OR OpenAI OR CoreWeave) "data center" '
       '(lease OR leases) (cancel OR canceled OR pause OR paused OR defer OR deferred OR '
       '"force majeure" OR "walks away" OR "pulls back") when:30d',
@@ -1870,23 +1900,31 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
      "a hyperscaler or AI lab cancelling, deferring, pausing, renegotiating, rephasing, scaling "
      "back or walking away from a data center lease or site, or invoking a contract exit such as "
      "force majeure",
-     "Ares's take-or-pay example shows these exits are written into the contracts."),
-    ("B", "Capex guidance",
+     "a story reports that one of the large cloud companies or AI labs is cancelling, delaying, pausing, "
+     "renegotiating, scaling back or walking away from a data center lease or site, or using a clause such "
+     "as force majeure to get out of a contract. Ares's example of a take-or-pay contract shows that such "
+     "exits are written into the contracts."),
+    ("B", "News of cuts to spending plans",
      ["(Microsoft OR Alphabet OR Amazon OR Meta OR Oracle) capex (cut OR cuts OR lower OR "
       "reduce OR slows OR guidance) when:30d"],
      "Microsoft, Alphabet, Amazon, Meta or Oracle lowering its plan or guidance for future capital "
      "spending (not one quarter's spending coming in below analysts' estimates, and not an "
      "accounting reclassification of the same spending)",
-     "That is the board-level shift Ares says would set off the guarantees, and it reaches the "
-     "news months before the filings."),
-    ("C", "OpenAI and Anthropic",
+     "a story reports that Microsoft, Alphabet, Amazon, Meta or Oracle has lowered its plan for future "
+     "capital spending. One quarter's spending coming in below analysts' estimates does not count, and "
+     "neither does an accounting change. Ares says that such a decision by a board would set off the "
+     "guarantees, and the news reports it months before it shows up in the filings."),
+    ("C", "News about OpenAI and Anthropic",
      ['OpenAI (funding OR revenue OR "cash burn" OR commitment OR valuation OR IPO) when:30d',
       'Anthropic (funding OR revenue OR "cash burn" OR commitment OR valuation) when:30d'],
      "OpenAI or Anthropic raising less, later or at a lower valuation than planned (including "
      "postponing a planned IPO or pricing it below its last private valuation), missing revenue "
      "targets, or cutting or renegotiating a compute commitment",
-     "Much of the debt depends on them paying."),
-    ("D", "Weak borrowers",
+     "a story reports that OpenAI or Anthropic has raised less money than planned, later or at a lower "
+     "valuation, has delayed a planned share sale or priced it below its last private valuation, has missed "
+     "revenue targets, or has cut or renegotiated a commitment to buy computing power. Much of the debt "
+     "depends on these two paying."),
+    ("D", "News about heavily indebted AI companies",
      ["CoreWeave (downgrade OR covenant OR refinancing OR default OR notes OR bond) when:30d",
       '(IREN OR TeraWulf OR "Cipher Mining" OR "Hut 8" OR "Applied Digital") (downgrade OR '
       "covenant OR refinancing OR default OR notes OR bond) when:30d"],
@@ -1895,20 +1933,26 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
      "covenant, pulling a bond deal or pricing one at a much higher yield, or its bonds or loans "
      "being reported as trading at distressed levels (for example below 80 cents on the dollar or "
      "yielding over 12%), or its credit default swaps above 1,000 basis points",
-     "These borrowers have to keep refinancing, so trouble shows here first."),
-    ("E", "Rating agencies",
+     "a story reports that CoreWeave or one of the former bitcoin miners, IREN, TeraWulf, Cipher, Hut 8 "
+     "and Applied Digital, has had its credit rating or bonds downgraded, missed a payment, broken or waived "
+     "a loan condition, pulled a bond sale or sold bonds at a much higher yield. It also counts if their "
+     "bonds or loans trade at distressed prices, such as below 80 cents on the dollar or at a yield above "
+     "12%, or if their credit default swaps trade above 1,000 basis points. These companies have to keep "
+     "borrowing to pay off old debt, so trouble shows here first."),
+    ("E", "News from rating agencies",
      ['(Moody\'s OR "S&P Global Ratings" OR Fitch) ("data center" OR hyperscaler OR GPU) '
       '(downgrade OR "negative outlook" OR review OR criteria) when:30d'],
      "a rating agency downgrading a data center, GPU or hyperscaler borrower or deal, putting "
      "one on negative outlook, or tightening its criteria for these deals",
-     "A criteria change can strip the investment-grade rating from a whole class of "
-     "structures at once."),
-    ("F", "Annuity sales",
+     "a story reports that a rating agency has downgraded a borrower or deal involving data centers, "
+     "GPUs or a large cloud company, put one on negative outlook, or tightened its rules for rating such "
+     "deals. A change of rules can take the investment-grade rating away from a whole type of deal at once."),
+    ("F", "News about annuity sales",
      ["LIMRA annuity sales when:180d"],
      "LIMRA reporting a quarter of total US annuity sales below the same quarter a year earlier",
-     "Record annuity sales are the insurer money that buys the investment-grade AI debt "
-     "(Ares's first flow)."),
-    ("G", "Compute glut",
+     "a story reports that LIMRA's total US annuity sales for a quarter were below the same quarter a "
+     "year earlier. Annuity sales bring in the insurers' money that buys the investment-grade AI debt."),
+    ("G", "News of too much computing power",
      ['("GPU" OR "AI compute" OR "data center capacity") (glut OR oversupply OR overcapacity OR '
       '"excess capacity" OR "idle capacity" OR "price war") when:30d',
       '("GPU cloud" OR neocloud OR "AI data center") (bankruptcy OR "Chapter 11" OR liquidation OR '
@@ -1922,9 +1966,13 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
      "deal with SpaceX); a GPU cloud or data center operator going bankrupt, or its "
      "chips or sites being sold by lenders or liquidators; or a company writing down AI chips or "
      "data centers, or shortening the useful life it depreciates them over",
-     "Hempton's test: compute has a high capital cost and a low marginal cost and is sold in "
-     "competition, so once supply passes demand its price falls towards the cost of running it, "
-     "and the owners who borrowed to build can't pay."),
+     "a story reports that a seller of computing power has idle, unsold or unpowered capacity or is "
+     "cutting its prices, that a customer has cancelled or not renewed a contract for computing power, that "
+     "a GPU cloud or data center operator has gone bankrupt or had its chips or sites sold by lenders, or "
+     "that a company has written down AI chips or data centers or shortened the life over which it "
+     "depreciates them. John Hempton's argument is that computing power costs a lot to build and little to "
+     "run and is sold in competition, so once supply passes demand its price falls towards the cost of "
+     "running it, and owners who borrowed to build cannot pay."),
 ]
 FEEDS = {f[0]: f for f in HEADLINE_FEEDS}
 
@@ -2186,7 +2234,7 @@ def headlines():
             rejudge.setdefault(st_["feed"], []).append((sid, st_, hs))
 
     total = len(picked)
-    status = f"{total} headlines."
+    status = f"This run found {total} headlines."
     if pending or rejudge:
         sections = []
         for fid, items in by_feed.items():
@@ -2224,20 +2272,21 @@ def headlines():
                 known[every[hid]["key"]]["story"] = sid
             for sid in set(assigned.values()):
                 stories[sid].setdefault("judged_size", sum(1 for x in assigned.values() if x == sid))
-            status += f" Judged {len(assigned)} new ones in one call ({tokens:,} tokens)."
+            status += f" The model judged {len(assigned)} new ones in one request, using {tokens:,} tokens."
             if rejudged:
-                status += f" Re-judged {rejudged} stor{'y' if rejudged == 1 else 'ies'} that had gained {REJUDGE_MIN_NEW}+ reports."
+                status += (f" It judged {rejudged} stor{'y' if rejudged == 1 else 'ies'} again after "
+                           f"{'it' if rejudged == 1 else 'each'} gained {REJUDGE_MIN_NEW} or more new reports.")
             if len(assigned) < len(pending) + len(twins):
-                status += (f" {len(pending) + len(twins) - len(assigned)} were missing from the reply and "
-                           "will be retried on the next run.")
+                status += (f" The model's reply left out {len(pending) + len(twins) - len(assigned)}, which will "
+                           "be tried again on the next run.")
         except Exception as e:
-            status += f" {len(pending)} new ones couldn't be judged today: {short_error(e)}"
+            status += f" {len(pending)} new ones could not be judged today ({short_error(e)})."
     else:
-        status += " None new to judge today."
+        status += " None of them were new."
     capped = {fid for fid in FEEDS if sum(1 for h in picked if h["feed"] == fid) < available[fid]}
     if capped:
-        status += (f" Capped at {MAX_HEADLINES} headlines in all; the oldest in the busiest searches "
-                   "were dropped.")
+        status += (f" The limit is {MAX_HEADLINES} headlines in all, so the oldest ones in the busiest "
+                   "searches were dropped.")
 
     feeds = {}
     for fid, items in by_feed.items():
@@ -2275,12 +2324,12 @@ def story_item(s):
     first, more = s["headlines"][0], s["headlines"][1:]
     tags = '<span class="bad">ALERT</span> ' if s["verdict"] == "alert" else ""
     tags += "<b>NEW</b> " if s["new"] else ""
-    reason = (f' <span class="muted">— {esc(s["reason"])}</span>'
+    reason = (f'<br><span class="muted">{esc(s["reason"])}</span>'
               if s["verdict"] == "alert" and s["reason"] else "")
     extra = ""
     if more:
         extra = (f"<details><summary>{len(more)} more report{'s' * (len(more) > 1)}, "
-                 f"latest {esc(more[-1]['date'])}</summary><ul>"
+                 f"the latest on {esc(more[-1]['date'])}</summary><ul>"
                  + "".join(f"<li>{headline_link(h)}</li>" for h in more) + "</ul></details>")
     return f"<li>{tags}{headline_link(first)}{reason}{extra}</li>"
 
@@ -2298,43 +2347,48 @@ def feed_block(fid):
     unjudged = [s for s in items if s["verdict"] is None]
     n_headlines = sum(len(s["headlines"]) for s in items)
     dates = sorted(h["date"] for s_ in items for h in s_["headlines"])
-    span = f"from {dates[0]} to {dates[-1]}" if dates else "none found"
-    out = (f'<p class="muted">{n_headlines} headlines {span}, grouped into {len(items)} stories'
-           + (f" (searches cover the last {window_days(FEEDS[fid][2][0])} days, but the cap on headlines "
-              "dropped the oldest here)" if feed["capped"] else "") + ".</p>")
+    out = '<p class="muted">' + (
+        f"{n_headlines} headline{'s' * (n_headlines != 1)} from {dates[0]} to {dates[-1]}, grouped into "
+        f"{len(items)} stor{'y' if len(items) == 1 else 'ies'}."
+        if dates else "No headlines were found.")
+    if feed["capped"]:
+        out += (f" The searches cover the last {window_days(FEEDS[fid][2][0])} days, but the oldest headlines "
+                "were dropped to stay within the limit.")
+    out += "</p>"
     if feed.get("carried"):
         n = feed["carried"]
-        verb = "wasn't" if n == 1 else "weren't"
-        out += (f'<p class="muted">{n} of these {verb} returned by today\'s search; they are kept from '
-                "earlier runs, because Google News sometimes returns an older set of results.</p>")
+        verb = "was" if n == 1 else "were"
+        out += (f'<p class="muted">{n} of these {verb} not returned by today\'s search. They are kept from '
+                "earlier runs because Google News sometimes returns an older set of results.</p>")
     if feed["error"]:
-        out += f'<p class="error">Some searches failed today: {esc(feed["error"])}</p>'
+        out += f'<p class="error">Some searches failed today ({esc(feed["error"])}).</p>'
     if flagged:
         out += "<ul>" + "".join(map(story_item, flagged)) + "</ul>"
     if rest:
         out += "<ul>" + "".join(map(story_item, rest[:VISIBLE_HEADLINES])) + "</ul>"
     more = rest[VISIBLE_HEADLINES:]
     if more:
-        out += (f"<details><summary>{len(more)} more stories "
-                f"({sum(s['new'] for s in more)} new today)</summary><ul>"
+        out += (f"<details><summary>{len(more)} more stories, {sum(s['new'] for s in more)} of them new "
+                "today</summary><ul>"
                 + "".join(map(story_item, more)) + "</ul></details>")
     detail = []
     if linked:
-        detail.append(f"{len(linked)} flagged {'story' if len(linked) == 1 else 'stories'} "
-                      f"({sum(s['new'] for s in linked)} new today). The model can be wrong; "
-                      "read them.")
+        n, new = len(linked), sum(s["new"] for s in linked)
+        fresh = "" if not new else ", which is new today" if n == 1 else f", {new} of them new today"
+        detail.append(f"The model flagged {n} {'story' if n == 1 else 'stories'}{fresh}. It can be wrong, so "
+                      f"read {'it' if n == 1 else 'them'}.")
     elif flagged:
-        detail.append("The flagged stories have no link to read, so check by hand.")
+        detail.append("The flagged stories have no link to read.")
     elif items and not unjudged and feed["capped"]:
-        detail.append(f"Nothing flagged among the newest {n_headlines} of {feed['available']} headlines, but "
-                      "the cap on headlines left out the oldest, so check by hand.")
+        detail.append(f"Nothing was flagged among the newest {n_headlines} of {feed['available']} headlines, "
+                      "but the oldest were left out because of the limit on headlines.")
     elif items and not unjudged:
-        detail.append(f"Nothing flagged among {len(items)} stories.")
+        detail.append(f"Nothing was flagged among {len(items)} stories.")
     if unjudged:
-        detail.append(f"{len(unjudged)} headlines not judged yet (see the note at the top of "
-                      "the Headlines section).")
+        detail.append(f"{len(unjudged)} headlines have not been judged yet, as the note at the top of the news "
+                      "section explains.")
     if feed["error"] and not flagged:
-        detail.append("Some searches failed, so stories may be missing: check by hand.")
+        detail.append("Some searches failed, so stories may be missing.")
     crossed = True if linked else (None if flagged or unjudged or feed["error"] or feed["capped"] else False)
     return out, crossed, " ".join(detail)
 
@@ -2597,13 +2651,14 @@ def fmt_change(v):
 
 
 def block_annuities():
-    rule = ("LIMRA's quarterly total U.S. annuity sales come in below the same quarter a year "
-            "earlier, two quarters in a row. Annuity sales bring in much of the insurer money that "
-            "Ares says buys the investment-grade AI debt (its first flow).")
+    rule = ("LIMRA's figures for total US annuity sales come in below the same quarter of the year before, "
+            "two quarters in a row. Annuity sales bring in much of the insurers' money that, according to "
+            "Ares, buys the investment-grade AI debt.")
     try:
         best, problems, info = limra_quarters()
     except Exception as e:
-        best, problems, info = {}, [f"LIMRA releases unavailable today: {short_error(e)}"], {}
+        best, problems, info = {}, [f"LIMRA's releases could not be read today ({short_error(e)})."], {}
+    qname = lambda q: f"Q{q[-1]} {q[:4]}"
     definition = info.get("definition")
     across = lambda q: definition is not None and int(q[:4]) == definition
     out = ""
@@ -2612,41 +2667,42 @@ def block_annuities():
         rows = []
         for q in reversed(quarters[-6:]):
             v = best[q]
-            yoy = "not stated" if v["yoy"] is None else fmt_change(v["yoy"]) + (" (computed)" if v.get("computed") else "")
+            yoy = "not stated" if v["yoy"] is None else fmt_change(v["yoy"]) + (", worked out from the totals" if v.get("computed") else "")
             if v["yoy"] is not None and v["yoy"] < 0:
                 yoy = f'<span class="bad">{yoy}</span>'
             if across(q) and v["yoy"] is not None:
                 yoy += " †"
             rows.append([f"Q{q[-1]} {q[:4]}", f"${v['total']:,.1f}B", yoy, v["status"],
                          f'<a href="{esc(v["url"])}">{esc(v["released"])}</a>'])
-        out += table(["Quarter", "Total U.S. annuity sales", "vs. same quarter a year earlier",
+        out += table(["Quarter", "Total US annuity sales", "Change from the same quarter a year earlier",
                       "Figures", "LIMRA release"], rows)
     expected = expected_limra_quarter(TODAY)
     crossed, detail = None, ""
     if len(quarters) < 2:
-        detail = "Too few quarters found."
+        detail = "Too few quarters were found."
     elif expected not in best:
-        detail = (f"LIMRA's figures for {expected} should be out by now but weren't found (the release may be "
-                  "missing from LIMRA's sitemap and newsroom page, or its figures failed the checks), so check by hand.")
+        detail = (f"LIMRA's figures for {qname(expected)} should be out by now but were not found. The release may "
+                  "be missing from LIMRA's sitemap and newsroom page, or its figures may have failed the checks.")
     else:
         a, b = best[quarters[-2]], best[quarters[-1]]
         if next_quarter(quarters[-2]) != quarters[-1]:
-            detail = f"{quarters[-2]} and {quarters[-1]} aren't consecutive quarters, so check by hand."
+            detail = f"{qname(quarters[-2])} and {qname(quarters[-1])} are not consecutive quarters."
         elif a["yoy"] is None or b["yoy"] is None:
-            detail = "A year-over-year change is missing for one of the last two quarters, so check by hand."
+            detail = "The change from a year earlier is missing for one of the last two quarters."
         elif across(quarters[-1]) or across(quarters[-2]):
-            detail = (f"Last two quarters: {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} as LIMRA states them, "
-                      f"but LIMRA changed its sales definition from its January {definition} report (sales now "
-                      "include internal transfers between a company's own contracts), and its "
-                      f"{definition} changes compare with {definition - 1} figures as first published, which may "
-                      "use the old definition. The comparison may not be like for like, so check by hand.")
+            detail = (f"LIMRA reports changes of {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} for the last two "
+                      f"quarters. It changed its definition of sales starting with its January {definition} report, "
+                      "and sales now include transfers between contracts at the same company. Its "
+                      f"{definition} changes are measured against {definition - 1} figures as first published, which "
+                      "may use the old definition, so the comparison may not be like for like.")
         else:
             crossed = a["yoy"] < 0 and b["yoy"] < 0
-            detail = f"Last two quarters: {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} year over year."
+            detail = (f"Sales changed by {fmt_change(a['yoy'])} and {fmt_change(b['yoy'])} from a year earlier in "
+                      "the last two quarters.")
             if b["status"] == "preliminary":
                 rev = info.get("revision")
-                detail += (" The latest figures are preliminary" +
-                           (f"; LIMRA's final figures have moved such changes by up to {rev:.0f} points." if rev else "."))
+                detail += (" The latest figures are preliminary." +
+                           (f" LIMRA's final figures have moved such changes by up to {rev:.0f} points." if rev else ""))
     out += line(rule, crossed, detail)
     for p in problems:
         out += f'<p class="error">{esc(p)}</p>'
@@ -2654,84 +2710,83 @@ def block_annuities():
         news, _, news_detail = feed_block("F")
     except Exception as e:
         print(f"ERROR in annuity sales news: {e!r}", file=sys.stderr)
-        warn("Annuity sales news: unavailable today")
-        news, news_detail = f'<p class="error">Annuity sales news unavailable today: {esc(short_error(e))}</p>', ""
-    out += f"<h4>Annuity sales news</h4>{news}"
+        warn("Could not read the news about annuity sales today.")
+        news, news_detail = f'<p class="error">The news about annuity sales could not be read today ({esc(short_error(e))}).</p>', ""
+    out += f"<h4>News about annuity sales</h4>{news}"
     if news_detail:
         out += f'<p class="muted">{news_detail}</p>'
     rejected = info.get("rejected")
     return out + (
-        '<p class="muted">Source: <a href="https://www.limra.com/en/newsroom/news-releases/">LIMRA '
-        "news releases</a>, found through LIMRA's sitemap and its newsroom page. "
-        f"{esc(DEEPSEEK_MODEL_NAME)} copies each quarter's total and year-over-year change from the "
-        "release text; a figure is used only if the sentence it quotes appears in the release word "
-        "for word, is a single sentence about total annuity sales (not a product line, half-year or "
-        "year-to-date figure), and contains that exact total and quarter, and a change only if the "
-        "sentence ties it to the same quarter a year earlier and it agrees with the totals. Final "
-        "figures replace preliminary ones. If anything is missing, out of date or not like for like, "
-        "the line falls back to checking by hand."
-        + (f" {rejected} figure{'s' * (rejected != 1)} read from recent releases failed the checks and "
+        '<p class="muted">Source: <a href="https://www.limra.com/en/newsroom/news-releases/">LIMRA\'s news '
+        "releases</a>, found through LIMRA's sitemap and newsroom page. "
+        f"{esc(DEEPSEEK_MODEL_NAME)} copies each quarter's total and its change from a year earlier out of the "
+        "release. A figure is used only if the sentence it quotes appears word for word in the release, is a "
+        "single sentence about total annuity sales, and contains that exact total and quarter. Figures for "
+        "one product, for half a year or for the year to date are not used. A change is used only if the "
+        "sentence ties it to the same quarter a year earlier and it agrees with the totals. Final figures "
+        "replace preliminary ones. If anything is missing, out of date or not like for like, the line has to "
+        "be checked by hand."
+        + (f" {rejected} figure{'s' * (rejected != 1)} read from recent releases failed these checks and "
            f"{'were' if rejected != 1 else 'was'} left out." if rejected else "")
-        + (" † compares across LIMRA's change of definition." if definition else "") + "</p>")
+        + (" A † marks a change measured across LIMRA's change of definition." if definition else "") + "</p>")
 
 
 def block_news():
-    out = ('<p class="muted">Headlines reporting the same event are grouped into one story, '
-           "listed under its first report. ALERT = "
-           f"{esc(DEEPSEEK_MODEL_NAME)} judged that the story is a concrete event matching "
-           f"that section's line; it can be wrong, so read the story. NEW = first seen by this dashboard "
-           f"today and first reported in the last {NEW_DAYS} days. "
+    out = ('<p class="muted">Headlines that report the same event are grouped into one story, listed under '
+           f"its first report. ALERT means that {esc(DEEPSEEK_MODEL_NAME)} judged the story to be a concrete "
+           "event that matches its section's warning line. The model can be wrong, so read the story. NEW means "
+           f"that this page first saw the story today and that it was first reported in the last {NEW_DAYS} days. "
            f"{esc(headlines()[1])}</p>")
     for fid in FEEDS:
         if fid == "F":  # annuity sales news sits with the LIMRA figures
             continue
-        _, title, _, flag_when, why = FEEDS[fid]
+        title, rule = FEEDS[fid][1], FEEDS[fid][4]
         html_, crossed, detail = feed_block(fid)
-        SECTION[0] = (f"Headlines: {title}", slug(f"headlines {title}"))
+        SECTION[0] = (title, slug(title))
         out += f'<h3 id="{SECTION[0][1]}">{esc(title)}</h3>' + html_
-        out += line(f"a story reports {flag_when}. {why}", crossed, detail)
+        out += line(rule, crossed, detail)
     return out + source("Google News search", "https://news.google.com/")
 
 
 SECTIONS = [
     ("1. Credit", [
         ("Corporate bond spreads", block_spreads),
-        ("Credit default swaps: market-implied default probability", block_cds),
-        ("Most heavily borrowed AI names (stock prices)", block_weak_borrowers),
+        ("Chance of default implied by credit default swaps", block_cds),
+        ("Share prices of the most heavily indebted AI companies", block_weak_borrowers),
     ]),
-    ("2. Capex and income", [
-        ("Hyperscaler capex and free cash flow", block_hyperscalers),
-        ("Is revenue keeping up with the capex?", block_payback),
-        ("Nvidia revenue and receivables", block_nvidia),
+    ("2. Spending and income", [
+        ("Capital spending and free cash flow at the large cloud companies", block_hyperscalers),
+        ("Revenue compared with capital spending", block_payback),
+        ("Nvidia's revenue and receivables", block_nvidia),
         ("Nvidia's stakes in and guarantees for other companies", block_nvidia_financing),
         ("Contract backlog at Oracle, Microsoft, Alphabet and CoreWeave", block_backlog),
         ("Commitments not on the balance sheet", block_commitments),
     ]),
-    ("3. Compute: supply and demand", [
+    ("3. Computing power", [
         ("GPU rental prices", block_gpu_prices),
-        ("Size of the build-out", block_buildout),
+        ("Investment in computers and software", block_buildout),
         ("Businesses using AI", block_adoption),
     ]),
     ("4. Insurance", [
         ("Annuity sales", block_annuities),
     ]),
-    ("5. Headlines", [
+    ("5. News", [
         ("", block_news),
     ]),
 ]
 
 NOT_HERE = (
-    "Not tracked here: prices of the private placements and securitizations Ares describes, the exit "
-    "clauses inside individual deals, insurers' return on equity (it is in their filings, but not as "
-    "a comparable tagged figure), Microsoft's and Amazon's off-balance-sheet commitments (not tagged "
-    "comparably), the leases not yet started at Alphabet and Oracle and Nvidia's supply and capacity "
-    "commitments (stated only in the text of their filings). From Hempton's argument: what OpenAI and "
-    "Anthropic themselves earn and spend on compute (Anthropic's S-1 isn't tagged for machines; its "
-    "quarterly reports will be once it is listed), the prices in private compute contracts, how much "
-    "installed capacity sits idle, and what the model makers charge per token. "
-    "The quarterly company figures lag by up to four months. Ares's own advice is to "
-    "\"reef early\": reduce sail well before the storm arrives, because \"cycles are easy, but timing "
-    "is hard.\""
+    "This page does not track the prices of the private placements and securitizations that Ares "
+    "describes, the exit clauses in individual deals, or insurers' return on equity, which their filings "
+    "give but not as a comparable tagged figure. It also lacks Microsoft's and Amazon's commitments that "
+    "are not on their balance sheets, Alphabet's and Oracle's leases that have not started, and Nvidia's "
+    "supply and capacity commitments, because these are not tagged comparably or appear only in the text "
+    "of filings. Of the things John Hempton discusses, it lacks what OpenAI and Anthropic earn and spend on "
+    "computing power, the prices in private contracts for computing power, how much installed capacity is "
+    "idle, and what the model makers charge. Anthropic's S-1 is not tagged for machines to read, but its "
+    "quarterly reports will be once it is listed. The quarterly company figures lag by up to four months. "
+    "Ares's own advice is to \"reef early\", which means reducing sail well before the storm arrives, "
+    "because \"cycles are easy, but timing is hard.\""
 )
 
 CSS = """
@@ -2746,11 +2801,15 @@ ul{margin:6px 0;padding-left:20px}
 details{margin:4px 0}
 summary{cursor:pointer;color:#333}
 .line{background:#f6f6f6;padding:6px 8px;margin:6px 0}
+.line p{margin:0 0 4px}
+.line p:last-child{margin:0}
 .bad{color:#b00020;font-weight:700}
 .warnings{border:1px solid #b00020;background:#fff5f5;padding:6px 12px;margin:8px 0}
 .warnings ul{margin:4px 0}
 .glance{border:1px solid #bbb;padding:6px 12px;margin:10px 0}
-.glance p{margin:4px 0}
+.glance p{margin:6px 0 2px}
+.glance ul{margin:0;columns:2;column-gap:24px}
+@media (max-width:600px){.glance ul{columns:1}}
 .muted{color:#666;font-size:12px;margin:4px 0}
 h4{font-size:13px;margin:16px 0 2px}
 .legend{font-size:12px;color:#52514e;margin:6px 0}
@@ -2773,11 +2832,14 @@ def glance():
         worst[(title, anchor)] = max(worst.get((title, anchor), 0), 2 if crossed else 1 if crossed is None else 0)
     if not worst:
         return ""
-    out = '<div class="glance"><b>Where the lines stand</b> (a section is listed under the worst of its lines)'
-    for rank, label in ((2, '<span class="bad">WARNING</span>'), (1, "Check by hand"), (0, "No warning")):
-        links = [f'<a href="#{esc(anchor)}">{esc(title)}</a>' for (title, anchor), r in worst.items() if r == rank]
+    out = ('<div class="glance"><p>This list puts each section below under the most serious state of its '
+           "warning lines.</p>")
+    for rank, label in ((2, '<span class="bad">There is a warning today</span> in these sections.'),
+                        (1, "These sections have to be checked by hand today."),
+                        (0, "There is no warning today in these sections.")):
+        links = [f'<li><a href="#{esc(anchor)}">{esc(title)}</a></li>' for (title, anchor), r in worst.items() if r == rank]
         if links:
-            out += f"<p>{label}: {' · '.join(links)}</p>"
+            out += f"<p>{label}</p><ul>{''.join(links)}</ul>"
     return out + "</div>"
 
 
@@ -2787,7 +2849,7 @@ def main():
     if CACHED:
         if not os.path.exists(FETCHED_AT):
             sys.exit("No saved responses yet: run once without --cached first.")
-        generated = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC from data fetched {generated}"
+        generated = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC from data fetched at {generated}"
         out = PREVIEW  # never the live page
     else:
         os.makedirs(HTTP_CACHE, exist_ok=True)
@@ -2805,10 +2867,10 @@ def main():
                 body.append(fn())
             except Exception as e:  # one broken source shouldn't sink the page
                 print(f"ERROR in {title or heading}: {e!r}", file=sys.stderr)
-                warn(f"{title or heading}: could not be built today")
-                body.append(f'<p class="error">Could not fetch this signal today: {esc(short_error(e))}</p>')
-            body.extend(f'<p class="error">Saved data: {esc(n)}</p>' for n in FALLBACKS[seen:])
-    body.append("<h2>Not on this dashboard</h2>")
+                warn(f"The section {title or heading} could not be built today.")
+                body.append(f'<p class="error">This section could not be built today ({esc(short_error(e))}).</p>')
+            body.extend(f'<p class="error">{esc(n)}</p>' for n in FALLBACKS[seen:])
+    body.append("<h2>What this page does not track</h2>")
     body.append(f"<p>{esc(NOT_HERE)}</p></body></html>")
     head = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -2816,26 +2878,24 @@ def main():
         f"<meta name='generated' content='{NOW:%Y-%m-%dT%H:%M:%SZ}'>",  # read by site/src/worker.js
         f"<title>AI Bubble Watch</title><style>{CSS}</style></head><body>",
         "<h1>AI Bubble Watch</h1>",
-        f'<p class="muted">Generated {generated}. Signals from free public sources; the CDS, annuity '
-        "and headline sections use a language model (DeepSeek) to read news and LIMRA releases, with the "
-        "checks described there. Each signal shows a line where this dashboard suggests starting to worry; "
-        "these lines are the dashboard's own, not its sources', and there is no overall score. The signals "
-        'follow Ares\'s Fall 2026 <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
-        'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a> newsletter, '
-        '<a href="https://www.groundbrkr.com/t/ai">Groundbreaker</a> and John Hempton\'s interview on the '
-        f'Joe Walker Podcast, <a href="{HEMPTON_URL}">Why Data Centres Will Change the World and Bankrupt '
-        "Their Builders</a>.</p>",
-        '<p class="muted">Ares looks at the debt that pays for the build-out. Hempton looks at the business '
-        "being financed: AI compute has a high capital cost and a low marginal cost and is sold in "
-        "competition while the technology keeps improving, as fiber optics did around 2000 and solar panels "
-        "have since. Businesses like that can change the world and still lose their builders' money once "
-        "supply catches up with demand. He puts the danger with whoever owns the chips, and is less sure "
-        "about the companies that make the models. The signals taken from him are the spot price of "
-        "compute, revenue against capex, Nvidia's funding of other companies, the size of the build-out, "
-        "how fast businesses take up AI, and the compute-glut headlines.</p>",
+        f'<p class="muted">This page was built at {generated}. It tracks signs that the AI investment boom '
+        "is turning into a bust, using free public sources. A language model, DeepSeek, reads news headlines "
+        "and LIMRA's press releases, and each section explains how its answers are checked. Each signal has a "
+        "line at which this page suggests starting to worry. The lines are this page's own, and there is no "
+        "overall score.</p>",
+        '<p class="muted">The signals follow three sources. Ares\'s Fall 2026 newsletter, '
+        '<a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
+        'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a>, looks at the debt that pays for the data '
+        'centers. The second is <a href="https://www.groundbrkr.com/t/ai">Groundbreaker</a>. The third is John '
+        f'Hempton\'s interview on the Joe Walker Podcast, <a href="{HEMPTON_URL}">Why Data Centres Will Change '
+        "the World and Bankrupt Their Builders</a>. Hempton argues that computing power costs a lot to build "
+        "and little to run, that one provider's is much like another's, and that the technology keeps "
+        "improving. Businesses like that, such as fiber optic networks around 2000 and solar panel makers "
+        "since, can change the world and still lose their builders' money once supply catches up with "
+        "demand. He sees the most danger for the companies that own the chips.</p>",
     ]
     if WARNINGS:
-        head.append('<div class="warnings"><b>Problems in this run:</b><ul>'
+        head.append('<div class="warnings"><p>These problems came up while this page was being built.</p><ul>'
                     + "".join(f"<li>{esc(w)}</li>" for w in WARNINGS) + "</ul></div>")
     head.append(glance())
     tmp = out + ".tmp"
