@@ -84,8 +84,14 @@ Vendors differ by 5–10% on the same day, and posts cluster on record days.
      much as the other. A quote within 30 days that disagrees overrules it;
    - evidence on both sides of a trade that agrees settles it; where it disagrees, the side flips
      on the day the net cash came closest to zero; evidence on one side only counts within 30 days.
-   Trades still unsettled keep both readings; a month where most are unsettled is drawn as a band
-   between the two (Oracle Nov 2024–May 2025, Nvidia Jun 2026 at the 2026-10-20 run).
+   Trades still unsettled keep both readings. A month where most are unsettled takes whichever of
+   its two readings is closer, on a log scale, to the nearest settled month on each side
+   (`infer_sides`), settling runs of such months outward from the known ones. The two readings are
+   usually several times apart, so this is rarely close. At the 2026-11-15 run it put Oracle's
+   Jan–May 2025 at about 3–4% (the other reading was about 13%), Nvidia's Jun 2026 at 3.2% (13.5%;
+   the published level near Jun 1 is about 38bp, which is the 3.2% reading) and CoreWeave's Nov
+   2026 at 62% (7.5%). These months are drawn as hollow dots. Only a month with no settled month on
+   either side, or an exact tie, is still drawn as a band between the two readings.
    The coupon-date test is weakest when the market moves about as much as the accrued coupon over
    the same few days (CoreWeave's Sep 2026 test decided by 51bp versus 86bp).
 4. **Bad prints.** A settled trade more than 3× above or below the median of at least three

@@ -524,9 +524,11 @@ CHART_FONT = "font:11px system-ui,sans-serif;display:block"
 
 
 def legend(items):
-    """HTML legend for two or more series: [(name, color)]."""
-    return '<p class="legend">' + "".join(
-        f'<span class="key" style="background:{c}"></span>{esc(n)}' for n, c in items) + "</p>"
+    """A legend with one item per line, its symbol first: [(name, color)], or [(name, style)] for a
+    symbol drawn with its own CSS. name may hold HTML."""
+    key = lambda k: f"background:{k}" if k.startswith("#") else k
+    return '<ul class="legend">' + "".join(
+        f'<li><span class="sym"><span class="key" style="{key(k)}"></span></span>{n}</li>' for n, k in items) + "</ul>"
 
 
 def nice_ticks(lo, hi, n=4):
@@ -1228,7 +1230,7 @@ def block_gpu_prices():
             f'<span class="bad">{pct(c13)}</span>' if name in crossed else pct(c13),
             pct(worst), pct((avg(len(weeks) - 1) / avg(GPU_AVG_WEEKS - 1) - 1) * 100),
         ])
-    out = legend([(n, c) for n, c, _ in lines])
+    out = legend([(esc(n), c) for n, c, _ in lines])
     out += ('<p class="muted">The weekly median advertised price to rent one GPU on demand, in dollars per hour. '
             'Sold-out listings are left out, and the median shifts as providers come and go.</p>')
     fmt = lambda v, tick=False: f"${v:.0f}" if tick else f"${v:.2f}"
@@ -1346,7 +1348,7 @@ def block_buildout():
                        + and_list(f"from {quarter_name(a)} to {quarter_name(b)}" for a, b, _ in past)
                        + f", with the deepest fall {max(x for *_, x in past):.2f} points.")
     fmt = lambda v, tick=False: f"{v:.0f}%" if tick else f"{v:.1f}%"
-    out = legend([(n, c) for n, c, _ in lines])
+    out = legend([(esc(n), c) for n, c, _ in lines])
     out += ('<p class="muted">US business investment in computers, communications equipment and software as a '
             "share of GDP, every quarter since 1990.</p>")
     aria = "US investment in computers, communications equipment and software as a share of GDP since 1990"
@@ -1698,15 +1700,17 @@ def block_cds():
     peak = max([s.hi or s.median for series, *_ in data.values() for s in series if s.median is not None]
                + [to_pd(r["bp"] / 1e4) for rows in reported.values() for r in rows if start <= r["date"] <= today] + [0.01])
     top = cds_signal.nice_pd_max(peak)
-    out = ('<p class="legend">'
-           '<span class="key" style="background:#2a78d6;border:2px solid #2a78d6;width:6px;height:6px;border-radius:50%"></span>'
-           'Monthly estimate from trades, with its 90% range '
-           '<span class="key" style="background:#2a78d6;opacity:.25;width:8px;height:14px;border-radius:4px"></span>'
-           'Month where the data can\'t tell who paid up front, showing both readings '
-           '<span class="key" style="background:#eb6834;width:9px;height:9px;transform:rotate(45deg);border-radius:1px"></span>'
-           'Level reported in the news '
-           '<span class="key" style="background:#8f8d87;height:2px"></span>'
-           'Share price, left axis, log scale</p>'
+    dot = "border:2px solid #2a78d6;width:6px;height:6px;border-radius:50%"
+    keys = [("Monthly estimate from trades, with its 90% range", f"background:#2a78d6;{dot}"),
+            ("Month where the data don't show who paid up front, placed at the reading that fits the months "
+             "around it", f"background:#fff;{dot}")]
+    if any(s.unresolved for series, *_ in data.values() for s in series if s.median is not None):
+        keys.append(("Month that can't be settled either way, showing both readings",
+                     "background:#2a78d6;opacity:.25;width:8px;height:14px;border-radius:4px"))
+    keys += [("Level reported in the news",
+              "background:#eb6834;width:9px;height:9px;transform:rotate(45deg);border-radius:1px"),
+             ("Share price, left axis, log scale", "background:#8f8d87;height:2px")]
+    out = (legend(keys) +
            '<p class="muted">The right axis is the chance of default within five years, on the same scale for all '
            'three companies. Faded dots had fewer than three trading days. Hover over a point for details.</p>')
     rows, gaps = [], []
@@ -1747,7 +1751,8 @@ def block_cds():
             spread = f"{bp(s.alt):,.0f} or {bp(s.median):,.0f}bp"
             rec = "n/a"
         else:
-            est = (pct_text(s.median) if pct_text(s.lo) == pct_text(s.hi)
+            est = (f"{pct_text(s.median)}, the reading that fits the months around it" if s.inferred
+                   else pct_text(s.median) if pct_text(s.lo) == pct_text(s.hi)
                    else f"{pct_text(s.median)}, from {pct_text(s.lo)} to {pct_text(s.hi)}")
             spread = f"{bp(s.median):,.0f}bp"
             rec_lo, rec_hi = (by_rec.get(r) for r in cds_signal.RECOVERY_RANGE)
@@ -1773,7 +1778,9 @@ def block_cds():
         "dollar trades on each company's own debt with four and a half to five and a half years left, leaving "
         "out index trades, changes to existing trades and obvious misprints. DTCC doesn't say who paid a trade's "
         "up-front payment, so that's worked out from quoted spreads and from how prices move around coupon "
-        "dates, and when it can't be, both readings are shown. The method and its checks are in "
+        "dates. When neither settles it, a month takes whichever of its two readings is closer to the months "
+        "around it, which is easy to tell because the two are usually several times apart. The method and its "
+        "checks are in "
         "cds/CDS_VALIDATION.md.</p>")
 
 
@@ -2713,9 +2720,9 @@ NOT_HERE = (
 
 CSS = """
 body{font:14px/1.45 system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#111;background:#fff}
-h1{font-size:20px;margin-bottom:4px}
-h2{font-size:16px;margin-top:36px;border-bottom:1px solid #bbb;padding-bottom:4px}
-h3{font-size:14px;margin:22px 0 6px}
+h1{font-size:28px;line-height:1.2;margin:0 0 8px}
+h2{font-size:22px;line-height:1.25;margin:44px 0 4px;border-bottom:2px solid #bbb;padding-bottom:6px}
+h3{font-size:17px;line-height:1.3;margin:30px 0 8px}
 table{border-collapse:collapse;width:100%;margin:6px 0}
 td,th{border:1px solid #ddd;padding:4px 6px;text-align:left;vertical-align:top}
 th{background:#f3f3f3;font-weight:600}
@@ -2733,15 +2740,16 @@ summary{cursor:pointer;color:#333}
 .glance ul{margin:0;columns:2;column-gap:24px}
 @media (max-width:600px){.glance ul{columns:1}}
 .muted{color:#666;font-size:12px;margin:4px 0}
-h4{font-size:13px;margin:16px 0 2px}
-.legend{font-size:12px;color:#52514e;margin:6px 0}
+h4{font-size:15px;margin:20px 0 4px}
+.legend{font-size:12px;color:#52514e;margin:6px 0;padding:0;list-style:none}
+.legend li{margin:2px 0}
+.sym{display:inline-block;width:16px;margin-right:6px;text-align:center}
 .multiples{display:flex;flex-wrap:wrap;gap:4px 12px}
 .multiples>div{flex:0 1 300px;min-width:260px}
 .narrow{display:none}
 @media (max-width:600px){.wide{display:none}.narrow{display:block}}
-.multiples h5{margin:8px 0 0;font-size:12px}
-.key{display:inline-block;width:14px;height:8px;vertical-align:middle;margin:0 5px 0 12px;border-radius:2px}
-.legend .key:first-child{margin-left:0}
+.multiples h5{margin:8px 0 0;font-size:13px}
+.key{display:inline-block;width:14px;height:8px;vertical-align:middle;border-radius:2px}
 .error{color:#b00020}
 """
 

@@ -62,6 +62,10 @@ Thresholds are constants near the top of the file, and the page text is built fr
 
 Some data is kept between runs in `data/`. `headlines.json` stores every headline and the model's verdict on it, so each headline is judged once. `limra.json` stores the figures read from each LIMRA release. `oracle_prepayments.json` stores a figure that Oracle tags only in its own XBRL extension. `cds_news.json` stores CDS levels read from headlines.
 
+## The CDS estimate
+
+DTCC doesn't report who paid a trade's up-front payment, and the two readings can be several times apart. `cds_signal.py` settles this from quoted spreads and coupon dates where it can. A month it can't settle takes the reading closer, on a log scale, to the nearest settled months, and the chart shows it as a hollow dot. `cds/CDS_VALIDATION.md` explains the whole method.
+
 ## The language model
 
 DeepSeek is used in three places, always as `deepseek-flash`. `check_model` stops each use if that name no longer points at `DEEPSEEK_MODEL_NAME`. Its answers are checked against the source text before they are used.

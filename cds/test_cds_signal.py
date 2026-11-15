@@ -243,5 +243,25 @@ class Monthly(unittest.TestCase):
         self.assertAlmostEqual(sep.alt, 0.21)
 
 
+class InferSides(unittest.TestCase):
+    def month(self, m, median, alt=None):
+        unresolved = alt is not None
+        return c.Month(date(2026, m, 1), median, None if unresolved else median, None if unresolved else median,
+                       5, unresolved, 5, date(2026, m, 15), date(2026, m, 28), alt)
+
+    def test_takes_the_reading_closer_to_its_neighbours(self):
+        months = [self.month(1, 0.58), self.month(2, 0.62, 0.075)]
+        last = c.infer_sides(months)[-1]
+        self.assertEqual((last.median, last.alt, last.unresolved, last.inferred), (0.62, 0.075, False, True))
+
+    def test_a_run_of_unresolved_months_is_settled_from_the_known_side(self):
+        months = [self.month(1, 0.13, 0.031), self.month(2, 0.133, 0.036), self.month(3, 0.03)]
+        settled = c.infer_sides(months)
+        self.assertEqual([m.median for m in settled], [0.031, 0.036, 0.03])
+
+    def test_nothing_to_go_on_stays_unresolved(self):
+        self.assertTrue(c.infer_sides([self.month(1, 0.13, 0.03), self.month(2, None)])[0].unresolved)
+
+
 if __name__ == "__main__":
     unittest.main()

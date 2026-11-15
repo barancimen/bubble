@@ -465,7 +465,7 @@ def months(start, end):
         m = (m.replace(day=28) + timedelta(days=4)).replace(day=1)
 
 
-Month = namedtuple("Month", "month median lo hi n unresolved days mid last alt")
+Month = namedtuple("Month", "month median lo hi n unresolved days mid last alt inferred", defaults=(False,))
 
 
 def monthly(pts, start, end):
@@ -502,13 +502,45 @@ def monthly(pts, start, end):
     return out
 
 
-def recovery_range(rows, start, month):
+def infer_sides(months):
+    """Settles each unresolved month by the months around it: of its two readings, it takes the one
+    closer on a log scale to the nearest settled month before it and the nearest after it. The two
+    readings are usually several times apart, so the months around them show which is right.
+    Months are settled outward from the known ones, so a run of unresolved months is settled one
+    by one, each from its newly settled neighbour. A settled-this-way month has inferred=True,
+    keeps the other reading in alt, and has no interval. A month with no settled month on either
+    side, or whose two readings are exactly as close, stays unresolved."""
+    months = list(months)
+    known = lambda m: m.median is not None and not m.unresolved
+    stuck = set()
+    while True:
+        open_ = [i for i, m in enumerate(months) if m.median is not None and m.unresolved and i not in stuck]
+        gaps = [(min((abs(i - j) for j, m in enumerate(months) if known(m)), default=None), i) for i in open_]
+        gaps = [(g, i) for g, i in gaps if g is not None]
+        if not gaps:
+            return months
+        _, i = min(gaps)
+        m = months[i]
+        before = next((months[j].median for j in range(i - 1, -1, -1) if known(months[j])), None)
+        after = next((months[j].median for j in range(i + 1, len(months)) if known(months[j])), None)
+        refs = [r for r in (before, after) if r]
+        far = lambda p: sum(abs(math.log(p / r)) for r in refs)
+        if far(m.median) == far(m.alt):
+            stuck.add(i)
+            continue
+        pick, other = (m.median, m.alt) if far(m.median) < far(m.alt) else (m.alt, m.median)
+        months[i] = m._replace(median=pick, alt=other, unresolved=False, inferred=True)
+
+
+def recovery_range(rows, start, month, buyer=None):
     """{recovery rate: median 5y default probability of the settled trades in month} for R and each
-    RECOVERY_RANGE rate (None if none are settled)."""
+    RECOVERY_RANGE rate (None if none are settled). For a month settled by infer_sides, buyer says
+    which reading it took (True if the buyers paid the up-fronts), and its unsettled trades count
+    with that reading."""
     out = {}
     for rec in sorted({R, *RECOVERY_RANGE}):
-        v = {(d, round(p, 6)) for d, p, ok, _ in trade_pds(rows, start, rec, since=month)
-             if ok and d.replace(day=1) == month}
+        v = {(d, round(p if ok or buyer else alt, 6)) for d, p, ok, alt in trade_pds(rows, start, rec, since=month)
+             if (ok or buyer is not None) and d.replace(day=1) == month}
         out[rec] = st.median(p for _, p in v) if v else None
     return out
 
@@ -522,9 +554,11 @@ def series(today, download=True):
     out = {}
     for t, rows in scan(today).items():
         pts = trade_pds(rows, start)
-        data = monthly(pts, start, today)
-        have = [s.month for s in data if s.median is not None]
-        out[t] = (data, recovery_range(rows, start, have[-1]) if have else {}, pts)
+        data = infer_sides(monthly(pts, start, today))
+        have = [s for s in data if s.median is not None]
+        # trade_pds puts the buyers-paid reading first, and it is the higher of the two
+        buyer = None if not have or not have[-1].inferred else have[-1].median >= have[-1].alt
+        out[t] = (data, recovery_range(rows, start, have[-1].month, buyer) if have else {}, pts)
     return out
 
 
@@ -589,7 +623,7 @@ def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
     the news on the same axis (reported = [(date, probability, tooltip)]), and the stock's daily
     close on a log scale (left axis). Each month's dot sits at the middle of its trade dates;
     months with fewer than MIN_DAYS trading days are faded and not joined up; unresolved months
-    show both readings as a band."""
+    show both readings as a band, and months settled by infer_sides are hollow dots."""
     pw, ph = W - ML - MR, H - MT - MB
     span = (end - start).days
     x = lambda d: ML + (d - start).days / span * pw
@@ -652,6 +686,12 @@ def svg_chart(ticker, data, closes, start, end, top=None, reported=()):
                 out.append(f'<circle cx="{xx:.1f}" cy="{y(v):.1f}" r="3" fill="#fff" stroke="{PD_COLOR}" stroke-width="1.5"/>')
             continue
         opacity = ' opacity="0.45"' if s.days < MIN_DAYS else ""
+        if s.inferred:
+            out.append(f'<circle cx="{xx:.1f}" cy="{y(s.median):.1f}" r="4" fill="#fff" stroke="{PD_COLOR}" '
+                       f'stroke-width="2"{opacity}><title>{period(s)}. A {s.median * 100:.1f}% chance of default, '
+                       f"from {days}. The data don't show who paid the up-front payments, and this reading fits "
+                       f"the months around it better than the other one, {s.alt * 100:.1f}%.{thin}</title></circle>")
+            continue
         out.append(f'<line x1="{xx:.1f}" x2="{xx:.1f}" y1="{y(s.hi):.1f}" y2="{y(s.lo):.1f}" '
                    f'stroke="{PD_COLOR}" stroke-width="2" stroke-linecap="round" opacity="0.45"/>')
         out.append(f'<circle cx="{xx:.1f}" cy="{y(s.median):.1f}" r="4" fill="{PD_COLOR}" stroke="#fff" stroke-width="2"{opacity}>'
