@@ -140,7 +140,7 @@ class Spreads(unittest.TestCase):
             return b"<!doctype html><title>Site Maintenance | St. Louis Fed</title>"
         with mock.patch.object(b, "_download", side_effect=download):
             page = b.block_spreads()
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
         self.assertIn("Site Maintenance", page)
         self.assertIn("not available today", page)
 
@@ -195,7 +195,7 @@ class Quarterly(unittest.TestCase):
         with mock.patch.object(b, "sec_concept",
                                side_effect=lambda cik, c: ar if c == "AccountsReceivableNetCurrent" else facts):
             page = b.block_nvidia()
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
         self.assertNotIn("a warning today", page)
 
 
@@ -227,16 +227,16 @@ class Receivables(unittest.TestCase):
         ar[quarter_ends(14)[5]] = 55e9  # an earlier high inside the three years
         page = b.receivables_line(rev, ar)
         self.assertIn("no warning today", page)
-        self.assertIn("highest in the three years before was 55.6", page)
+        self.assertIn("previous three-year high was 55.6", page)
 
     def test_missing_receivables_is_checked_by_hand(self):
         rev, ar = self.series(60e9)
         del ar[quarter_ends(14)[-1]]
-        self.assertIn("checked by hand today", b.receivables_line(rev, ar))
-        self.assertIn("checked by hand today", b.receivables_line(rev, {}, "sec.gov down"))
+        self.assertIn("checking by hand today", b.receivables_line(rev, ar))
+        self.assertIn("checking by hand today", b.receivables_line(rev, {}, "sec.gov down"))
 
     def test_too_little_history_is_checked_by_hand(self):
-        self.assertIn("checked by hand today", b.receivables_line(*self.series(60e9, n=6)))
+        self.assertIn("checking by hand today", b.receivables_line(*self.series(60e9, n=6)))
 
 
 class HeadlineCap(unittest.TestCase):
@@ -292,7 +292,7 @@ class CarriedOver(unittest.TestCase):
         feeds = {"A": {"stories": [story], "error": None, "capped": False, "available": 1, "carried": 1}}
         with mock.patch.object(b, "headlines", return_value=(feeds, "")):
             html, crossed, _ = b.feed_block("A")
-        self.assertIn("1 of these was not returned by today's search", html)
+        self.assertIn("1 of these was missing from today's search", html)
         self.assertIs(crossed, True)
 
 
@@ -338,7 +338,7 @@ class OneSourceDown(unittest.TestCase):
             page = b.block_hyperscalers()
         self.assertIn("not available today (SEC 503)", page)
         self.assertIn("<h5>MSFT</h5>", page)
-        self.assertEqual(page.count("checked by hand today"), 2)
+        self.assertEqual(page.count("checking by hand today"), 2)
         self.assertNotIn("no warning today", page)
 
     def test_weak_borrowers(self):
@@ -348,7 +348,7 @@ class OneSourceDown(unittest.TestCase):
             return [(str(date(2026, 1, 1) + timedelta(days=i)), 100.0) for i in range(80)]
         with mock.patch.object(b, "yahoo_closes", side_effect=closes):
             page = b.block_weak_borrowers()
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
         self.assertIn("Yahoo timeout", page)
         self.assertIn("<td>CRWV</td>", page)
 
@@ -360,7 +360,7 @@ class OneSourceDown(unittest.TestCase):
             return weeks if billing == "ON_DEMAND" else []
         with mock.patch.object(b, "gpu_weekly", side_effect=gpu):
             page = b.block_gpu_prices()
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
         self.assertIn("H100", page)
 
     def test_every_source_down_fails_the_signal(self):
@@ -411,7 +411,7 @@ class LastGood(unittest.TestCase):
         with mock.patch.object(b, "yahoo_closes", side_effect=closes):
             page = b.block_weak_borrowers()
         self.assertIn("close of 2026-03-20", page)
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
 
 
 def gpu_weeks(prices, sellers=10):
@@ -471,13 +471,13 @@ class Buildout(unittest.TestCase):
     def test_fall_from_the_two_year_high_warns(self):
         page = self.page([40.0] * 20 + [45.0, 50.0, 47.0])  # 5.0% of GDP, then 4.7%
         self.assertIn("a warning today", page)
-        self.assertIn("0.30 points below the high of the last two years, 5.00% in Q2 1995", page)
-        self.assertIn("Since 1992 this has never happened.", page)
+        self.assertIn("0.30 points below its two-year high of 5.00% in Q2 1995", page)
+        self.assertIn("That hasn't happened since 1992.", page)
 
     def test_at_the_high_does_not(self):
         page = self.page([40.0] * 20 + [45.0, 50.0])
         self.assertIn("no warning today", page)
-        self.assertIn("the highest of the last two years", page)
+        self.assertIn("its highest in two years", page)
 
     def test_narrow_series_down_leaves_the_line(self):
         def fred(sid, scale=100):
@@ -550,13 +550,13 @@ class Adoption(unittest.TestCase):
     def test_rising_use_is_no_warning(self):
         page = self.page([18.0 + i * 0.5 for i in range(12)])
         self.assertIn("no warning today", page)
-        self.assertIn("2.5% of businesses said that using AI had reduced their number of employees", page)
+        self.assertIn("2.5% of businesses said AI had cut their headcount", page)
 
     def test_flat_use_warns(self):
         self.assertIn("a warning today", self.page([18.0, 19.0, 20.0] + [21.0] * 9))
 
     def test_old_or_short_series_is_checked_by_hand(self):
-        self.assertIn("too few surveys", self.page([18.0, 19.0, 20.0]))
+        self.assertIn("enough surveys yet", self.page([18.0, 19.0, 20.0]))
         page = self.page([18.0 + i * 0.5 for i in range(12)], today=date(2027, 1, 1))
         self.assertIn("which is unusually old", page)
 
@@ -588,17 +588,17 @@ class Payback(unittest.TestCase):
         page = self.page(1e9)  # each quarter $1B above the last: $16B more over four quarters
         self.assertIn("no warning today", page)
         self.assertIn("<td>11.4</td><td>16.0</td><td>1.40</td>", page)
-        self.assertIn("All 5 together added $80B, against $57B needed", page)
+        self.assertIn("All 5 together added $80B against $57B needed", page)
 
     def test_too_little_new_revenue_warns(self):
         page = self.page(0.5e9)  # $8B more
         self.assertIn("a warning today", page)
         self.assertIn('<span class="bad">0.70</span>', page)
-        self.assertIn("MSFT, GOOGL, AMZN, META and ORCL added less revenue than the spending needs", page)
+        self.assertIn("MSFT, GOOGL, AMZN, META and ORCL added less revenue than its spending calls for", page)
 
     def test_one_company_down_is_checked_by_hand(self):
         page = self.page(1e9, missing=1652044)
-        self.assertIn("checked by hand today", page)
+        self.assertIn("checking by hand today", page)
         self.assertIn("not available today (SEC 503)", page)
         self.assertIn("All 4", page)
 
@@ -631,10 +631,10 @@ class NvidiaFinancing(unittest.TestCase):
     def test_loss_warns(self):
         page = self.page([1e9] * 7 + [-2e9])
         self.assertIn("a warning today", page)
-        self.assertIn("a loss of $2.0B on its investments in the quarter ending Jun 30, 2026, after a gain of $1.0B the quarter before", page)
+        self.assertIn("a loss of $2.0B on its investments in the quarter to Jun 30, 2026, after a gain of $1.0B the quarter before", page)
 
     def test_untagged_gains_are_checked_by_hand(self):
-        self.assertIn("are not tagged in its filings", self.page([]))
+        self.assertIn("doesn't tag its investment gains and losses", self.page([]))
 
 
 class Landlords(unittest.TestCase):
@@ -648,7 +648,7 @@ class Landlords(unittest.TestCase):
     def test_chip_owners_falling_alone_warns_on_both_lines(self):
         page = self.page(70.0, 101.0)
         self.assertEqual(page.count("a warning today"), 2)
-        self.assertIn("the six moved -30.0% on average and the landlords +1.0%", page)
+        self.assertIn("the six fell 30.0% on average and the landlords rose 1.0%", page)
 
     def test_everything_falling_together_warns_only_against_the_market(self):
         page = self.page(70.0, 70.0)
@@ -661,9 +661,9 @@ class Glance(unittest.TestCase):
         with mock.patch.object(b, "STATUS", [("Spreads", "spreads", False), ("Capex", "capex", False),
                                               ("Capex", "capex", True), ("Annuities", "annuities", None)]):
             page = b.glance()
-        self.assertIn('There is a warning today</span> in these sections.</p><ul><li><a href="#capex">Capex</a></li></ul>', page)
-        self.assertIn('checked by hand today.</p><ul><li><a href="#annuities">Annuities</a></li></ul>', page)
-        self.assertIn('no warning today in these sections.</p><ul><li><a href="#spreads">Spreads</a></li></ul>', page)
+        self.assertIn('There\'s a warning today</span> in these sections.</p><ul><li><a href="#capex">Capex</a></li></ul>', page)
+        self.assertIn('checking by hand today.</p><ul><li><a href="#annuities">Annuities</a></li></ul>', page)
+        self.assertIn('no warning today in these.</p><ul><li><a href="#spreads">Spreads</a></li></ul>', page)
 
     def test_lines_are_recorded_under_the_section_being_built(self):
         with mock.patch.object(b, "STATUS", []), mock.patch.object(b, "SECTION", [("GPU rental prices", "gpu-rental-prices")]):
