@@ -1191,7 +1191,12 @@ def block_gpu_prices():
             rows.append([name, f'<span class="error">unavailable today{": " + esc(err) if err else ""}</span>',
                          "n/a", "n/a", "n/a", "n/a", "n/a"])
             continue
-        row, spot13, worst_spot = gpu_other_ways(slug, name, {w: p for w, p, _ in weeks})
+        try:  # the spot prices shouldn't take the on-demand line down with them
+            row, spot13, worst_spot = gpu_other_ways(slug, name, {w: p for w, p, _ in weeks})
+        except Exception as e:
+            print(f"ERROR in {name} spot prices: {e!r}", file=sys.stderr)
+            warn(f"{name} spot prices: unavailable today ({short_error(e)})")
+            row, spot13, worst_spot = [name, '<span class="error">unavailable today</span>'] + ["n/a"] * 4, None, None
         spot_rows.append(row)
         if spot13 is None:
             spot_thin.append(name)
@@ -2336,13 +2341,15 @@ def feed_block(fid):
 
 # ---------- LIMRA quarterly annuity sales ----------
 #
-# LIMRA has no data feed, but every news release is listed in its sitemap and states the quarter's
+# LIMRA has no data feed, but every news release is listed in its sitemap (and the newest ones on
+# its newsroom page, which is sometimes weeks ahead of the sitemap) and states the quarter's
 # total in prose, worded differently each time. DeepSeek reads each release once and copies out the
 # figures with the sentence they come from; a figure is used only if that sentence is in the
 # release word for word and contains the exact total and change. Releases are remembered in
 # LIMRA_STORE, so each is read once.
 
 LIMRA_SITEMAP = "https://www.limra.com/sitemap.xml"
+LIMRA_NEWSROOM = "https://www.limra.com/en/newsroom/"  # lists the newest releases, sometimes before the sitemap does
 LIMRA_STORE = os.path.join(HERE, "data", "limra.json")
 LIMRA_YEARS = 3  # releases this many calendar years back are read
 QUARTER_WORDS = {1: "first quarter", 2: "second quarter", 3: "third quarter", 4: "fourth quarter"}
@@ -2492,6 +2499,21 @@ def read_release(url):
     return rec
 
 
+def limra_release_urls():
+    """([URL of every release LIMRA lists], problem or None). The sitemap has them all but can be
+    weeks out of date, so the newsroom page, which shows the newest few, is read as well; if that
+    page can't be read the sitemap is used alone and the problem is reported."""
+    urls = re.findall(r"<loc>([^<]+)</loc>", fetch(LIMRA_SITEMAP, check=xml_check).decode("utf-8", "replace"))
+    try:
+        page = fetch(LIMRA_NEWSROOM).decode("utf-8", "replace")
+    except Exception as e:
+        return urls, (f"LIMRA's newsroom page couldn't be read today ({short_error(e)}), so only its sitemap "
+                      "was searched for new releases; the sitemap can be weeks behind.")
+    for href in re.findall(r'href="([^"]*/newsroom/news-releases/20\d\d/[^"]+)"', page):
+        urls.append(urllib.parse.urljoin(LIMRA_NEWSROOM, html.unescape(href)))
+    return urls, None
+
+
 def limra_quarters():
     """({quarter: chosen figure}, [problems], info) from every annuity release in the window. Per
     quarter, a final figure beats a preliminary one, then the later release wins. info holds the
@@ -2501,14 +2523,19 @@ def limra_quarters():
     store = load_json_store(LIMRA_STORE)
     problems = []
     first_year = TODAY.year - LIMRA_YEARS
-    xml = fetch(LIMRA_SITEMAP, check=xml_check).decode("utf-8", "replace")
-    for url in re.findall(r"<loc>([^<]+)</loc>", xml):
+    urls, problem = limra_release_urls()
+    if problem:
+        problems.append(problem)
+    same = lambda u: u.rstrip("/").lower()  # one release can be listed with and without a final slash
+    read = {same(u) for u in store}
+    for url in urls:
         low = url.lower()
         if "/newsroom/news-releases/" not in low or "annuit" not in low:
             continue
         y = re.search(r"/news-releases/(20\d\d)/", url)
-        if url in store or (y and int(y.group(1)) < first_year):
+        if same(url) in read or (y and int(y.group(1)) < first_year):
             continue
+        read.add(same(url))
         try:
             store[url] = read_release(url)
         except Exception as e:  # leave it out of the store so the next run tries again
@@ -2600,7 +2627,7 @@ def block_annuities():
         detail = "Too few quarters found."
     elif expected not in best:
         detail = (f"LIMRA's figures for {expected} should be out by now but weren't found (the release may be "
-                  "missing from LIMRA's sitemap, or its figures failed the checks), so check by hand.")
+                  "missing from LIMRA's sitemap and newsroom page, or its figures failed the checks), so check by hand.")
     else:
         a, b = best[quarters[-2]], best[quarters[-1]]
         if next_quarter(quarters[-2]) != quarters[-1]:
@@ -2635,7 +2662,7 @@ def block_annuities():
     rejected = info.get("rejected")
     return out + (
         '<p class="muted">Source: <a href="https://www.limra.com/en/newsroom/news-releases/">LIMRA '
-        "news releases</a>, found through LIMRA's sitemap. "
+        "news releases</a>, found through LIMRA's sitemap and its newsroom page. "
         f"{esc(DEEPSEEK_MODEL_NAME)} copies each quarter's total and year-over-year change from the "
         "release text; a figure is used only if the sentence it quotes appears in the release word "
         "for word, is a single sentence about total annuity sales (not a product line, half-year or "

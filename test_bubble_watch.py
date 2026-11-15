@@ -692,5 +692,41 @@ class NewFeed(unittest.TestCase):
         self.assertNotIn("Annuity sales", page)
 
 
+class LimraReleases(unittest.TestCase):
+    SITEMAP = (b"<urlset><url><loc>https://www.limra.com/en/newsroom/news-releases/2026/q2-annuity-sales/</loc></url>"
+               b"</urlset>")
+    NEWSROOM = (b'<a href="/en/newsroom/news-releases/2026/q2-annuity-sales">Q2</a>'
+                b'<a href="/en/newsroom/news-releases/2026/q3-annuity-sales-$126.3-billion">Q3</a>')
+
+    def test_newsroom_page_adds_what_the_sitemap_lacks(self):
+        pages = {b.LIMRA_SITEMAP: self.SITEMAP, b.LIMRA_NEWSROOM: self.NEWSROOM}
+        with mock.patch.object(b, "fetch", side_effect=lambda url, **kw: pages[url]):
+            urls, problem = b.limra_release_urls()
+        self.assertIsNone(problem)
+        self.assertIn("https://www.limra.com/en/newsroom/news-releases/2026/q3-annuity-sales-$126.3-billion", urls)
+
+    def test_each_release_is_read_once_however_it_is_listed(self):
+        pages = {b.LIMRA_SITEMAP: self.SITEMAP, b.LIMRA_NEWSROOM: self.NEWSROOM}
+        read = []
+        def release(url):
+            read.append(url)
+            return dict(released="2026-11-05", status="preliminary", quarters=[], definition_change=None)
+        with mock.patch.object(b, "fetch", side_effect=lambda url, **kw: pages[url]), \
+                mock.patch.object(b, "read_release", side_effect=release), \
+                mock.patch.object(b, "load_json_store", return_value={}), mock.patch.object(b, "save_json_store"):
+            b.limra_quarters()
+        self.assertEqual(len(read), 2)  # Q2 once (listed with and without a final slash), and Q3
+
+    def test_sitemap_alone_when_the_newsroom_page_is_down(self):
+        def fetch(url, **kw):
+            if url == b.LIMRA_NEWSROOM:
+                raise RuntimeError("HTTP Error 503")
+            return self.SITEMAP
+        with mock.patch.object(b, "fetch", side_effect=fetch):
+            urls, problem = b.limra_release_urls()
+        self.assertEqual(len(urls), 1)
+        self.assertIn("newsroom page couldn't be read today (HTTP Error 503)", problem)
+
+
 if __name__ == "__main__":
     unittest.main()
