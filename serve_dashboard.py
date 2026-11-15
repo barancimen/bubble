@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serves dashboard.html, and nothing else, publicly on port 8080.
 
-The page is re-read on every request, so the daily cron run shows up
+The page is re-read on every request, so each cron run shows up
 without a restart. Runs as the bubble-dashboard systemd service.
 """
 import os
@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "dashboard.html")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
-STALE_HOURS = 30  # the page is rebuilt daily; older than this means a run failed
+STALE_HOURS = 30  # the page is rebuilt once or twice a day; older than this means a run failed
 
 # The page has no scripts, images or forms, so the browser is told to refuse all of them.
 SECURITY_HEADERS = {

@@ -354,10 +354,10 @@ class OneSourceDown(unittest.TestCase):
 
     def test_gpu_prices(self):
         weeks = [((b.GPU_START + timedelta(weeks=i)).isoformat(), 2.0, 10) for i in range(30)]
-        def gpu(slug):
+        def gpu(slug, billing="ON_DEMAND", months=""):
             if slug == "nvidia-b200":
                 raise RuntimeError("no on-demand rows for nvidia-b200")
-            return weeks
+            return weeks if billing == "ON_DEMAND" else []
         with mock.patch.object(b, "gpu_weekly", side_effect=gpu):
             page = b.block_gpu_prices()
         self.assertIn("Check by hand", page)
@@ -412,6 +412,284 @@ class LastGood(unittest.TestCase):
             page = b.block_weak_borrowers()
         self.assertIn("close of 2026-03-20", page)
         self.assertIn("Check by hand", page)
+
+
+def gpu_weeks(prices, sellers=10):
+    """Weekly GPU rows from GPU_START on, one per price."""
+    return [((b.GPU_START + timedelta(weeks=i)).isoformat(), p, sellers) for i, p in enumerate(prices)]
+
+
+class SpotPrices(unittest.TestCase):
+    def page(self, spot, sellers=10):
+        def gpu(slug, billing="ON_DEMAND", months=""):
+            return {"ON_DEMAND": gpu_weeks([4.0] * 30), "SPOT": gpu_weeks(spot, sellers)}.get(billing, [])
+        with mock.patch.object(b, "gpu_weekly", side_effect=gpu):
+            return b.block_gpu_prices()
+
+    def test_change_compares_four_week_averages(self):
+        weeks = gpu_weeks([2.0] * 17 + [1.0] * 4)
+        last = date.fromisoformat(weeks[-1][0])
+        self.assertEqual(b.gpu_change(weeks, last, 13), -50)
+        self.assertIsNone(b.gpu_change(weeks[1:], last, 17))  # the earlier stretch has a week missing
+        self.assertIsNone(b.gpu_change(weeks, last, 13, min_sellers=11))
+
+    def test_falling_spot_price_warns_while_on_demand_is_flat(self):
+        page = self.page([3.0] * 17 + [2.0] * 13)
+        self.assertEqual(page.count("No warning"), 1)  # on-demand
+        self.assertEqual(page.count("WARNING"), 1)     # spot
+        self.assertIn("Down 20% or more over 13 weeks: H100, H200, B200", page)
+
+    def test_steady_spot_price_does_not(self):
+        self.assertEqual(self.page([3.0] * 30).count("No warning"), 2)
+
+    def test_too_few_sellers_is_checked_by_hand(self):
+        page = self.page([3.0] * 17 + [2.0] * 13, sellers=2)
+        self.assertIn("Too few spot sellers to compare H100, H200, B200, so check by hand", page)
+        self.assertNotIn("WARNING", page)
+
+
+def fred_quarters(values, first=1990):
+    """[(quarter start, value)] for consecutive quarters from the first quarter of `first`."""
+    return [(date(first + i // 4, i % 4 * 3 + 1, 1).isoformat(), v) for i, v in enumerate(values)]
+
+
+class Buildout(unittest.TestCase):
+    def page(self, tech):
+        n = len(tech)
+        series = {"GDP": fred_quarters([1000.0] * n), "A679RC1Q027SBEA": fred_quarters(tech),
+                  "B935RC1Q027SBEA": fred_quarters([10.0] * n)}
+        today = date(1990 + n // 4, 1, 1)
+        with mock.patch.object(b, "fred_series", side_effect=lambda sid, scale=100: series[sid]), \
+                mock.patch.object(b, "TODAY", today):
+            return b.block_buildout()
+
+    def test_episodes(self):
+        pts = fred_quarters([4.0] * 10 + [3.9, 3.7, 3.6, 4.2, 4.2])
+        self.assertEqual([(a, z, round(x, 2)) for a, z, x in b.drop_episodes(pts, 0.25)],
+                         [("1992-10-01", "1993-01-01", 0.4)])
+
+    def test_fall_from_the_two_year_high_warns(self):
+        page = self.page([40.0] * 20 + [45.0, 50.0, 47.0])  # 5.0% of GDP, then 4.7%
+        self.assertIn("WARNING", page)
+        self.assertIn("0.30 points below its high of the last two years (5.00% in Q2 1995)", page)
+        self.assertIn("happened never before", page)
+
+    def test_at_the_high_does_not(self):
+        page = self.page([40.0] * 20 + [45.0, 50.0])
+        self.assertIn("No warning", page)
+        self.assertIn("its high of the last two years", page)
+
+    def test_narrow_series_down_leaves_the_line(self):
+        def fred(sid, scale=100):
+            if sid.startswith("B935"):
+                raise RuntimeError("FRED down")
+            return fred_quarters([1000.0] * 22) if sid == "GDP" else fred_quarters([40.0] * 20 + [45.0, 50.0])
+        with mock.patch.object(b, "fred_series", side_effect=fred), mock.patch.object(b, "TODAY", date(1995, 7, 1)):
+            page = b.block_buildout()
+        self.assertIn("No warning", page)
+        self.assertIn("unavailable today: FRED down", page)
+
+
+def xlsx(sheets):
+    """A minimal .xlsx with inline strings: {sheet name: [[cell, ...], ...]}."""
+    import io, zipfile
+    ns = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {ns} xmlns:r="{rel}"><sheets>' + "".join(
+            f'<sheet name="{name}" sheetId="{i}" r:id="rId{i}"/>' for i, name in enumerate(sheets, 1)) + "</sheets></workbook>")
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + "".join(
+                       f'<Relationship Type="{rel}/worksheet" Target="/xl/worksheets/sheet{i}.xml" Id="rId{i}"/>'
+                       for i in range(1, len(sheets) + 1)) + "</Relationships>")
+        for i, rows in enumerate(sheets.values(), 1):
+            cells = "".join(
+                f'<row r="{r}">' + "".join(
+                    f'<c r="{chr(64 + c)}{r}" t="inlineStr"><is><t>{v}</t></is></c>' for c, v in enumerate(row, 1) if v != "")
+                + "</row>" for r, row in enumerate(rows, 1))
+            z.writestr(f"xl/worksheets/sheet{i}.xml", f"<worksheet {ns}><sheetData>{cells}</sheetData></worksheet>")
+    return buf.getvalue()
+
+
+class Adoption(unittest.TestCase):
+    USE = "In the last two weeks, did this business use Artificial Intelligence (AI) in any of its business functions? (Examples)"
+    NEXT = "During the next six months, do you think this business will be using Artificial Intelligence (AI)?"
+    JOBS = "In the last six months, how did this business’s use of Artificial Intelligence affect the number of employees (total headcount) at this business?"
+
+    def book(self, shares):
+        surveys = [f"2026{i + 1:02d}" for i in range(len(shares))]
+        head = ["Question ID", "Question", "Answer ID", "Answer"] + surveys[::-1]  # newest first, as published
+        rows = [head,
+                ["7", self.USE, "1", "Yes"] + [f"{v}%" for v in shares[::-1]],
+                ["7", self.USE, "2", "No"] + [f"{100 - v}%" for v in shares[::-1]],
+                ["8", "In the last two weeks, did this business’s employees use Generative Artificial Intelligence?", "1", "Yes"]
+                + ["99.0%"] * len(shares),
+                ["28", self.NEXT, "1", "Yes"] + [f"{v + 3}%" for v in shares[::-1]],
+                ["9", self.JOBS, "1", "Increased"] + ["6.6%"] + ["."] * (len(shares) - 1),
+                ["9", self.JOBS, "2", "Decreased"] + ["2.5%"] + ["."] * (len(shares) - 1)]
+        first = (date(2026, 1, 4) - date(1899, 12, 30)).days  # Excel's day number
+        dates = [["Sample Year", "Cycle", "Panel", "Smpdt", "Collection Start", "Col End"]] + [
+            ["", "1", "1", s, str(first + 14 * i - 13), str(first + 14 * i)] for i, s in enumerate(surveys)]
+        return xlsx({"Response Estimates": rows, "Collection and Reference Dates": dates})
+
+    def page(self, shares, today=None):
+        last = date(2026, 1, 4) + timedelta(days=14 * (len(shares) - 1))
+        with mock.patch.object(b, "_download", return_value=self.book(shares)), \
+                mock.patch.object(b, "TODAY", today or last + timedelta(days=14)):
+            return b.block_adoption()
+
+    def test_reads_the_right_question_and_dates(self):
+        with mock.patch.object(b, "_download", return_value=self.book([20.0, 21.0, 22.5])):
+            answers, ends = b.btos()
+        question, use = b.btos_series(answers, ends, b.BTOS_USE)
+        self.assertEqual(question, self.USE)
+        self.assertEqual(use, [("2026-01-04", 20.0), ("2026-01-18", 21.0), ("2026-02-01", 22.5)])
+        self.assertEqual(b.btos_series(answers, ends, b.BTOS_NEXT)[1][-1], ("2026-02-01", 25.5))
+
+    def test_rising_use_is_no_warning(self):
+        page = self.page([18.0 + i * 0.5 for i in range(12)])
+        self.assertIn("No warning", page)
+        self.assertIn("2.5% of the businesses answering said that using AI had reduced their headcount", page)
+
+    def test_flat_use_warns(self):
+        self.assertIn("WARNING", self.page([18.0, 19.0, 20.0] + [21.0] * 9))
+
+    def test_old_or_short_series_is_checked_by_hand(self):
+        self.assertIn("Too few surveys", self.page([18.0, 19.0, 20.0]))
+        page = self.page([18.0 + i * 0.5 for i in range(12)], today=date(2027, 1, 1))
+        self.assertIn("unusually old, so check by hand", page)
+
+    def test_web_page_instead_of_a_spreadsheet(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(b, "LAST_GOOD", tmp), \
+                mock.patch.object(b, "_download", return_value=b"<html><title>Access Denied</title></html>"):
+            with self.assertRaisesRegex(RuntimeError, "sent a web page instead of data .Access Denied."):
+                b.btos()  # nothing saved to fall back on
+
+
+class Payback(unittest.TestCase):
+    """Capex of $10B a quarter needs 40 x 2/7 = $11.4B of new revenue a year."""
+
+    def page(self, revenue_step, missing=None):
+        def concept(cik, name):
+            if cik == missing:
+                raise RuntimeError("SEC 503")
+            return quarters(val=lambda i: 10e9)
+        def other(cik, name):
+            if name == b.REVENUE_CONCEPTS[0]:
+                return quarters(val=lambda i: 50e9 + i * revenue_step)
+            return quarters(val=lambda i: 2e9 + i * 1e9) if name == "Depreciation" else []
+        with mock.patch.object(b, "sec_concept", side_effect=concept), \
+                mock.patch.object(b, "sec_concept_or_empty", side_effect=other), \
+                mock.patch.object(b, "TODAY", date(2026, 5, 1)):
+            return b.block_payback()
+
+    def test_enough_new_revenue_is_no_warning(self):
+        page = self.page(1e9)  # each quarter $1B above the last: $16B more over four quarters
+        self.assertIn("No warning", page)
+        self.assertIn("<td>11.4</td><td>16.0</td><td>1.40</td>", page)
+        self.assertIn("The 5 together added $80B against $57B needed", page)
+
+    def test_too_little_new_revenue_warns(self):
+        page = self.page(0.5e9)  # $8B more
+        self.assertIn("WARNING", page)
+        self.assertIn('<span class="bad">0.70</span>', page)
+        self.assertIn("Added less than the capex needs: MSFT, GOOGL, AMZN, META, ORCL", page)
+
+    def test_one_company_down_is_checked_by_hand(self):
+        page = self.page(1e9, missing=1652044)
+        self.assertIn("Check by hand", page)
+        self.assertIn("unavailable today: SEC 503", page)
+        self.assertIn("The 4 together", page)
+
+    def test_newest_tag_wins(self):
+        old, new = quarters(n=4), quarters(n=8)
+        with mock.patch.object(b, "sec_concept_or_empty", side_effect=lambda cik, c: new if c == "Revenues" else old):
+            self.assertEqual(len(b.newest_flows(1, b.REVENUE_CONCEPTS)), 8)
+
+
+class NvidiaFinancing(unittest.TestCase):
+    def page(self, gains):
+        ends = quarter_ends(8)
+        stakes = [{"end": e, "val": (i + 1) * 5e9, "filed": "2026-08-01"} for i, e in enumerate(ends)]
+        flows = quarters(n=len(gains), start=date(2024, 7, 1), val=lambda i: gains[i])
+        def other(cik, name):
+            if name == "GainLossOnInvestments":
+                return flows
+            return stakes if name.startswith("EquitySecuritiesWithout") else []
+        with mock.patch.object(b, "sec_concept_or_empty", side_effect=other), \
+                mock.patch.object(b, "sec_concept", return_value=quarters(val=lambda i: 50e9)), \
+                mock.patch.object(b, "TODAY", date(2026, 8, 1)):
+            return b.block_nvidia_financing()
+
+    def test_gain_is_no_warning(self):
+        page = self.page([1e9] * 8)
+        self.assertIn("No warning", page)
+        self.assertIn("$40.0B (2026-06-30)</td><td>$20.0B (2025-06-30)</td><td>×2.0", page)
+        self.assertIn("not reported", page)  # the two figures with no facts
+
+    def test_loss_warns(self):
+        page = self.page([1e9] * 7 + [-2e9])
+        self.assertIn("WARNING", page)
+        self.assertIn("Quarter ending 2026-06-30: −$2.0B; the quarter before: +$1.0B", page)
+
+    def test_untagged_gains_are_checked_by_hand(self):
+        self.assertIn("not tagged in its filings, so check by hand", self.page([]))
+
+
+class Landlords(unittest.TestCase):
+    def page(self, six, landlords):
+        def closes(ticker, span="1y"):
+            end = landlords if ticker in dict(b.LANDLORDS) else 99.0 if ticker in ("QQQ", "ORCL") else six
+            return [(str(date(2026, 1, 1) + timedelta(days=i)), 100.0 if i < 60 else end) for i in range(80)]
+        with mock.patch.object(b, "yahoo_closes", side_effect=closes):
+            return b.block_weak_borrowers()
+
+    def test_chip_owners_falling_alone_warns_on_both_lines(self):
+        page = self.page(70.0, 101.0)
+        self.assertEqual(page.count("WARNING"), 2)
+        self.assertIn("the six -30.0% on average, the landlords +1.0%", page)
+
+    def test_everything_falling_together_warns_only_against_the_market(self):
+        page = self.page(70.0, 70.0)
+        self.assertEqual(page.count("WARNING"), 1)
+        self.assertEqual(page.count("No warning"), 1)
+
+
+class Glance(unittest.TestCase):
+    def test_a_section_is_listed_under_its_worst_line(self):
+        with mock.patch.object(b, "STATUS", [("Spreads", "spreads", False), ("Capex", "capex", False),
+                                              ("Capex", "capex", True), ("Annuities", "annuities", None)]):
+            page = b.glance()
+        self.assertIn('WARNING</span>: <a href="#capex">Capex</a></p>', page)
+        self.assertIn('Check by hand: <a href="#annuities">Annuities</a></p>', page)
+        self.assertIn('No warning: <a href="#spreads">Spreads</a></p>', page)
+
+    def test_lines_are_recorded_under_the_section_being_built(self):
+        with mock.patch.object(b, "STATUS", []), mock.patch.object(b, "SECTION", [("GPU rental prices", "gpu-rental-prices")]):
+            b.line("rule", True)
+            self.assertEqual(b.STATUS, [("GPU rental prices", "gpu-rental-prices", True)])
+
+
+class NewFeed(unittest.TestCase):
+    def test_reply_lines_for_every_feed_are_read(self):
+        reply = {"choices": [{"finish_reason": "stop", "message": {"content":
+                 "G1 NEW ALERT | Neocloud files for Chapter 11 | GPU cloud bankruptcy\nG2 SAME G1\nA1 NEW OK | Lease signed"}}],
+                 "usage": {"total_tokens": 10}}
+        with mock.patch.object(b, "check_model"), mock.patch.object(b, "deepseek", return_value=reply):
+            new, same, tokens = b.classify([])
+        self.assertEqual(new["G1"], ("ALERT", "Neocloud files for Chapter 11", "GPU cloud bankruptcy"))
+        self.assertEqual(same, {"G2": "G1"})
+        self.assertIn("A1", new)
+
+    def test_every_feed_but_annuities_is_in_the_headlines_section(self):
+        story = {"headlines": [{"date": "2026-11-13", "link": "https://example.com/a", "title": "t", "when": None}],
+                 "verdict": "ok", "reason": "", "new": False}
+        feeds = {f: {"stories": [story], "error": None, "capped": False, "available": 1} for f in b.FEEDS}
+        with mock.patch.object(b, "headlines", return_value=(feeds, "")):
+            page = b.block_news()
+        self.assertIn('<h3 id="headlines-compute-glut">Compute glut</h3>', page)
+        self.assertNotIn("Annuity sales", page)
 
 
 if __name__ == "__main__":

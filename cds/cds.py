@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 CACHE = HERE / "dtcc_cache"
 
 # Ticker -> reference-entity text to search for in the DTCC files.
-NAMES = {"CRWV": "COREWEAVE", "ORCL": "ORACLE"}
+NAMES = {"CRWV": "COREWEAVE", "ORCL": "ORACLE", "NVDA": "NVIDIA"}
 
 
 def fetch_day(day: dt.date) -> bytes | None:
