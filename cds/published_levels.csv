@@ -21,3 +21,13 @@ date,ticker,spread_bp,source,url,note,role
 2026-07-27,NVDA,82,ICE (via TMGM),https://www.tmgm.com/en/analysis/market-insight/nvidia-cds-record-high,record high,design
 2026-08-11,NVDA,72.11,Crypto Briefing,https://cryptobriefing.com/nvidia-credit-risk-spikes-as-cds-spreads-near-record-levels/,single source,holdout
 2026-09-28,NVDA,87,IFR,https://www.ifre.com/people-and-markets/2496665/hyperscaler-and-chipmaker-cds-widen-to-record-levels,record high,design
+2026-11-19,MSFT,48,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,GOOGL,85,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,AMZN,94,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,META,112,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,NVDA,129,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,AMD,147,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,AVGO,179,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,SPACEX,266,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,ORCL,316,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout
+2026-11-19,CRWV,1145,Bloomberg (via Groundbreaker),https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing,"close on Nov 17, 18 or 19",holdout

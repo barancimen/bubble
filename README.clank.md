@@ -11,19 +11,20 @@ The signals come from three sources. The first is Ares's Fall 2026 newsletter "I
 | Section | Data | Function |
 |---|---|---|
 | Corporate bond spreads | FRED | `block_spreads` |
-| Default risk from credit default swaps | DTCC swap trades, via `cds/cds_signal.py` | `block_cds` |
+| Market-implied ratings of ten AI companies | DTCC swap trades, with agency ratings and a ratings grid from Groundbreaker | `block_cds_ratings` |
+| Default risk from credit default swaps, charted for CoreWeave, Oracle and Nvidia | DTCC swap trades, via `cds/cds_signal.py` | `block_cds` |
 | Share prices of heavily indebted AI companies, with QQQ and two data center landlords | Yahoo Finance | `block_weak_borrowers` |
 | Big tech's capital spending and free cash flow | SEC EDGAR | `block_hyperscalers` |
 | Revenue against capital spending | SEC EDGAR | `block_payback` |
 | Nvidia's revenue and receivables | SEC EDGAR | `block_nvidia` |
-| Nvidia's stakes in and guarantees for other companies | SEC EDGAR | `block_nvidia_financing` |
+| Stakes in and guarantees for other companies, from Nvidia, Alphabet and Broadcom | SEC EDGAR | `block_nvidia_financing` |
 | Contract backlog | SEC EDGAR | `block_backlog` |
 | Commitments not on the balance sheet | SEC EDGAR | `block_commitments` |
 | GPU rental prices, on demand, spot and reserved | GetDeploying CSV files | `block_gpu_prices` |
 | Investment in computers and software as a share of GDP | FRED | `block_buildout` |
 | Businesses using AI | Census Bureau BTOS spreadsheet | `block_adoption` |
 | Annuity sales | LIMRA press releases, read by DeepSeek | `block_annuities` |
-| News, in six feeds | Google News RSS, judged by DeepSeek | `block_news` |
+| News, in seven feeds | Google News RSS, judged by DeepSeek | `block_news` |
 
 None of these needs an API key except DeepSeek, which reads its key from `DEEPSEEK_API_KEY` or `.deepseek_api_key`.
 
@@ -66,11 +67,15 @@ Some data is kept between runs in `data/`. `headlines.json` stores every headlin
 
 DTCC doesn't report who paid a trade's up-front payment, and the two readings can be several times apart. `cds_signal.py` settles this from quoted spreads and coupon dates where it can. A month it can't settle takes the reading closer, on a log scale, to the nearest settled months, and the chart shows it as a hollow dot. `cds/CDS_VALIDATION.md` explains the whole method.
 
+## Hand-maintained data
+
+`AGENCY_RATINGS` in `bubble_watch.py` holds the agency ratings of the ten companies in the market-implied ratings table, and `NOTCH_MEDIANS` holds the typical five-year spread for each rating. Both come from Groundbreaker's "Mark to Swap" article of November 20, 2026. Nothing updates them, so the page warns once the ratings are more than `AGENCY_STALE_DAYS` old. When a rating changes, edit the dict and `AGENCY_AS_OF`.
+
 ## The language model
 
 DeepSeek is used in three places, always as `deepseek-flash`. `check_model` stops each use if that name no longer points at `DEEPSEEK_MODEL_NAME`. Its answers are checked against the source text before they are used.
 
-For the news feeds, each entry in `HEADLINE_FEEDS` has an id, a title, the Google News searches, the rule the model is given and the rule shown on the page. Changing the model's rule or `CLASSIFY_INSTRUCTIONS` changes `criteria_hash`, which makes the model judge every stored story in that feed again. Changing the title or the rule shown on the page costs nothing. `MAX_HEADLINES` caps the headlines per run at 600, shared fairly between feeds.
+For the news feeds, each entry in `HEADLINE_FEEDS` has an id, a title, the Google News searches, the rule the model is given and the rule shown on the page. Changing the model's rule or `CLASSIFY_INSTRUCTIONS` changes `criteria_hash`, which makes the model judge every stored story in that feed again. Changing the title or the rule shown on the page costs nothing. `MAX_HEADLINES` caps the headlines per run at 700, shared fairly between feeds.
 
 ## Checking a change
 

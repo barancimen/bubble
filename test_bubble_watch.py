@@ -728,5 +728,52 @@ class LimraReleases(unittest.TestCase):
         self.assertIn("newsroom page couldn't be read today (HTTP Error 503)", problem)
 
 
+class MarketImpliedRatings(unittest.TestCase):
+    def test_grid_matches_the_articles_table(self):
+        cases = {48: "A+", 85: "BBB+", 94: "BBB", 112: "BBB-", 129: "BBB-", 147: "BB+", 179: "BB", 266: "B+",
+                 316: "B+", 1145: "CCC-", 10: "AAA"}
+        for bp, rating in cases.items():
+            self.assertEqual(b.NOTCHES[b.implied_notch(bp)], rating, bp)
+        self.assertEqual(b.NOTCHES[b.implied_notch(134)], "BBB-")
+        self.assertEqual(b.NOTCHES[b.implied_notch(135)], "BB+")
+
+    def page(self, spreads, today=date(2026, 11, 20)):
+        """spreads: {ticker: five-year spread in bp for November}, the rest of AGENCY_RATINGS without trades."""
+        import math
+        to_p = lambda bp: 1 - math.exp(-5 * b.cds_signal.hazard_from_spread(bp / 1e4))
+        data = {t: ([b.cds_signal.Month(date(2026, 11, 1), to_p(bp), to_p(bp), to_p(bp), 10, False, 8,
+                                        date(2026, 11, 10), date(2026, 11, 19), None)], {}, [])
+                for t, bp in spreads.items()}
+        with mock.patch.object(b, "cds_data", return_value=data), mock.patch.object(b, "TODAY", today), \
+                mock.patch.object(b, "WARNINGS", []):
+            return b.block_cds_ratings(), list(b.WARNINGS)
+
+    def test_a_wide_gap_warns_and_names_the_fallen_angels(self):
+        page, _ = self.page({"MSFT": 48, "META": 112, "ORCL": 316, "CRWV": 1145})
+        self.assertIn("a warning today", page)
+        self.assertIn("4 companies with recent trades average 4.8 notches below", page)
+        self.assertIn("Oracle is rated investment grade but trades as high yield", page)
+        self.assertIn("Alphabet, Amazon, Nvidia, AMD, Broadcom and SpaceX have no recent trades", page)
+
+    def test_spreads_in_line_with_ratings_do_not(self):
+        page, _ = self.page({"MSFT": 20, "ORCL": 120})
+        self.assertIn("no warning today", page)
+        self.assertIn("<td>none</td>", page)
+
+    def test_old_ratings_are_flagged(self):
+        _, warnings = self.page({"MSFT": 48}, today=date(2027, 6, 1))
+        self.assertTrue(any("update AGENCY_RATINGS" in w for w in warnings))
+
+
+class OtherGuarantees(unittest.TestCase):
+    def test_each_guarantor_gets_a_row(self):
+        facts = {1652044: [{"end": "2025-06-30", "val": 2e9, "filed": "x"}, {"end": "2026-06-30", "val": 7.6e9, "filed": "x"}],
+                 1730168: [{"end": "2026-08-02", "val": 29e9, "filed": "x"}]}
+        with mock.patch.object(b, "sec_concept_or_empty", side_effect=lambda cik, c: facts[cik]):
+            page = b.other_guarantees()
+        self.assertIn("<td>Alphabet</td><td>$7.6B on 2026-06-30</td><td>$2.0B on 2025-06-30</td>", page)
+        self.assertIn("<td>Broadcom</td><td>$29.0B on 2026-08-02</td><td>n/a</td>", page)
+
+
 if __name__ == "__main__":
     unittest.main()

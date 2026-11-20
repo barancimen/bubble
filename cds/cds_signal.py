@@ -46,6 +46,15 @@ ENTITIES = {
     "CRWV": dict(name="COREWEAVE", red="239FAV", isins={"US21873SAC26"}),
     "ORCL": dict(name="ORACLE", red="6EC42L", isins={"US68389XBN49"}),
     "NVDA": dict(name="NVIDIA", red="6D76CM", isins={"US67066GAN43"}),
+    # The other lessees and guarantors in Groundbreaker's "Mark to Swap", matched by RED code. SoftBank
+    # is left out because it has no usable US-dollar trades.
+    "META": dict(name="META PLATFORMS", red="UZEAAG", isins=set()),
+    "AVGO": dict(name="BROADCOM", red="1C248K", isins=set()),
+    "MSFT": dict(name="MICROSOFT", red="5EDDA9", isins=set()),
+    "GOOGL": dict(name="ALPHABET", red="0C27GT", isins=set()),
+    "AMZN": dict(name="AMAZON", red="0C5448", isins=set()),
+    "SPACEX": dict(name="SPACE EXPLORATION TECH", red="8CA76V", isins=set()),
+    "AMD": dict(name="ADVANCED MICRO DEVICES", red="007G93", isins=set()),
 }
 NAMES = {t: e["name"] for t, e in ENTITIES.items()}  # ticker -> reference entity
 WINDOW_DAYS = 730          # charts span the last 24 months

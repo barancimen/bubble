@@ -57,7 +57,8 @@ Vendors differ by 5–10% on the same day, and posts cluster on record days.
 ## How the estimate is built, and what can make it wrong
 
 1. **Which trades.** US-dollar standard-coupon (1% or 5%) trades on the company's own credit,
-   matched by RED code (CRWV 239FAV, ORCL 6EC42L, NVDA 6D76CM) or reference-bond ISIN, with the
+   matched by RED code (CRWV 239FAV, ORCL 6EC42L, NVDA 6D76CM, and since 2026-11-20 META UZEAAG,
+   AVGO 1C248K, MSFT 5EDDA9, GOOGL 0C27GT, AMZN 0C5448, SPACEX 8CA76V, AMD 007G93) or reference-bond ISIN, with the
    name as a fallback; another entity's RED code (e.g. ORACLE SYSTEMS CORP, 6EC42I) never matches.
    Only fresh trades count (new trades with event TRAD, and corrections of them): novations,
    modifications and terminations carry fees on existing trades. Legs of credit-index trades are
@@ -146,3 +147,11 @@ Oct 2025 to Oct 2026, median gap 2.9%, worst 9.5% (NVDA 2026-10-08, one trade). 
 2026-06-01 (~38bp) falls in an unresolved month whose two readings are 38bp and 175bp.
 
 **Sources:** see `published_levels.csv` for the URL of each level.
+
+## Check of 2026-11-20 against Bloomberg closes
+
+Groundbreaker's "Mark to Swap" (2026-11-20) gives Bloomberg five-year closes from November 17 to 19 for
+ten companies. These are in `published_levels.csv` as holdout rows dated 2026-11-19. Settled trades from
+November 13 to 20 gave MSFT 49 (Bloomberg 48), GOOGL 87 (85), AMZN 95 (94), META 112 (112), NVDA 122
+(129), AVGO 177 (179), SPACEX 265 (266) and ORCL 313 (316). CoreWeave and AMD had no settled trades in
+that week. SoftBank has no usable US-dollar trades and isn't priced.

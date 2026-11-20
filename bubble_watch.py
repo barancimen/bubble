@@ -64,6 +64,8 @@ ADOPTION_BACK = 6            # surveys (about three months) over which business 
 # John Hempton (Bronte Capital) on the Joe Walker Podcast: "Why Data Centres Will Change the World and
 # Bankrupt Their Builders". The signals marked "Hempton" on the page come from this interview.
 HEMPTON_URL = "https://www.youtube.com/watch?v=GY5YyPLfqp0"
+# Groundbreaker's "Mark to Swap" (Nov 20, 2026), the source of the market-implied ratings below.
+MARK_TO_SWAP_URL = "https://www.groundbrkr.com/p/mark-to-swap-how-the-market-is-mispricing"
 
 HYPERSCALERS = [  # ticker, SEC CIK, XBRL concept the company uses for capex
     ("MSFT", 789019, "PaymentsToAcquirePropertyPlantAndEquipment"),
@@ -72,7 +74,8 @@ HYPERSCALERS = [  # ticker, SEC CIK, XBRL concept the company uses for capex
     ("META", 1326801, "PaymentsToAcquirePropertyPlantAndEquipment"),
     ("ORCL", 1341439, "PaymentsToAcquirePropertyPlantAndEquipment"),
 ]
-BACKLOG = [("ORCL", 1341439), ("MSFT", 789019), ("GOOGL", 1652044), ("CRWV", 1769628)]
+BACKLOG = [("ORCL", 1341439), ("MSFT", 789019), ("GOOGL", 1652044), ("AVGO", 1730168), ("CRWV", 1769628)]
+GUARANTORS = [("GOOGL", 1652044, "Alphabet"), ("AVGO", 1730168, "Broadcom")]  # tag their guarantees as Nvidia does
 NVDA_CIK = 1045810
 COMMITMENTS = [  # ticker, CIK, concept, what the company's filings say the tagged figure is
     ("GOOGL", 1652044, "LongTermPurchaseCommitmentAmount", "Purchase commitments, mostly long-term supply agreements"),
@@ -86,7 +89,22 @@ COMMITMENTS = [  # ticker, CIK, concept, what the company's filings say the tagg
 WEAK_BORROWERS = ["CRWV", "IREN", "HUT", "CIFR", "WULF", "APLD", "ORCL"]
 WEAK_BASKET_PCT, WEAK_EACH_PCT, QQQ_CALM_PCT = 20, 15, 5  # see block_weak_borrowers
 LANDLORDS = [("DLR", "Digital Realty"), ("EQIX", "Equinix")]  # own the buildings and power, not the chips
-CDS_NAMES = [("CRWV", "CoreWeave"), ("ORCL", "Oracle"), ("NVDA", "Nvidia")]
+CDS_NAMES = [("CRWV", "CoreWeave"), ("ORCL", "Oracle"), ("NVDA", "Nvidia")]  # charted, and looked for in the news
+
+# Market-implied ratings, following Groundbreaker's "Mark to Swap": the median five-year CDS spread (bp)
+# at each S&P notch, with the boundary between two notches at the geometric mean of their medians.
+NOTCHES = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-",
+           "BB+", "BB", "BB-", "B+", "B", "B-", "CCC+", "CCC", "CCC-"]
+NOTCH_MEDIANS = [20, 26, 34, 41, 49, 58, 68, 81, 95, 120, 151, 190, 237, 296, 370, 488, 644, 850, 980]
+# Agency ratings of the companies behind the AI build, from the table in "Mark to Swap". Nothing updates
+# these, so they are dated, and a warning appears once they are AGENCY_STALE_DAYS old.
+AGENCY_RATINGS = {"MSFT": ("Microsoft", "AAA"), "GOOGL": ("Alphabet", "AA+"), "AMZN": ("Amazon", "AA"),
+                  "META": ("Meta", "AA-"), "NVDA": ("Nvidia", "AA"), "AMD": ("AMD", "A"),
+                  "AVGO": ("Broadcom", "A-"), "SPACEX": ("SpaceX", "BBB"), "ORCL": ("Oracle", "BBB-"),
+                  "CRWV": ("CoreWeave", "B+")}
+AGENCY_AS_OF = date(2026, 11, 19)
+AGENCY_STALE_DAYS = 120
+NOTCH_GAP_LINE = 4  # average notches below the agency ratings; Wall Street's broker-dealers were 4.6 in Feb 2007
 GPU_MODELS = [("nvidia-h100", "H100"), ("nvidia-h200", "H200"), ("nvidia-b200", "B200")]
 
 # Headline classification. "deepseek-flash" is DeepSeek's unversioned name, so each run checks
@@ -95,7 +113,7 @@ DEEPSEEK_MODEL = "deepseek-flash"
 DEEPSEEK_MODEL_NAME = "DeepSeek-V4.1-Flash"
 DEEPSEEK_KEY_FILE = os.path.join(HERE, ".deepseek_api_key")
 DEEPSEEK_TIMEOUT = 600
-MAX_HEADLINES = 600       # across all feeds; Google News returns at most 100 per search
+MAX_HEADLINES = 700       # across all feeds; Google News returns at most 100 per search
 VISIBLE_HEADLINES = 6     # per feed; the rest fold away
 HEADLINE_STORE = os.path.join(HERE, "data", "headlines.json")
 STORE_DAYS = 90           # forget headlines not seen for this long
@@ -1084,8 +1102,29 @@ def block_nvidia_financing():
             "customer. The guarantees cover land, power and building leases for AI data center operators if they "
             "default. Gains include paper gains when a private company raises money at a higher price."
             + notes.replace(" The newest", " * The newest", 1) + "</p>")
-    return out + source("SEC EDGAR XBRL filings (Nvidia)",
-                        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810")
+    out += "<h4>Guarantees from Alphabet and Broadcom</h4>" + other_guarantees()
+    return out + source("SEC EDGAR XBRL filings", "https://www.sec.gov/edgar/search/")
+
+
+def other_guarantees():
+    """The guarantees that Alphabet and Broadcom tag the same way as Nvidia, the most each could owe."""
+    rows = []
+    for (ticker, cik, name), series, err in per_item(GUARANTORS, lambda it: f"{it[2]}'s guarantees",
+                                                      lambda it: point_in_time(sec_concept_or_empty(
+                                                          it[1], "GuaranteeObligationsMaximumExposure"))):
+        if err or not series:
+            rows.append([name, not_available(err) if err else "not reported", "n/a"])
+            continue
+        last = list(series)[-1]
+        earlier = [(e, v) for e, v in series.items() if 250 <= days_between(e, last) <= 460]
+        prev = min(earlier, key=lambda ev: abs(days_between(ev[0], last) - 365)) if earlier else None
+        rows.append([name, f"${series[last] / 1e9:,.1f}B on {esc(last)}",
+                     f"${prev[1] / 1e9:,.1f}B on {esc(prev[0])}" if prev else "n/a"])
+    return (table(["Company", "Guarantees, at the most it could owe", "About a year earlier"], rows)
+            + '<p class="muted">According to Groundbreaker, Alphabet backs Fluidstack\'s leases for Anthropic and '
+            "Broadcom stands behind the companies that finance Anthropic\'s chips. Like Nvidia, they lend their "
+            "own credit to deals that couldn\'t get it on their own, so when their credit default swaps widen, "
+            "everything they back is worth less.</p>")
 
 
 def block_backlog():
@@ -1121,7 +1160,7 @@ def block_backlog():
                    + "</div>" for t, ends, v in panels) + "</div>"
     out += table(["Company", "Latest quarter", "vs the quarter before", "vs a year earlier"], rows)
     out += line(
-        "backlog at any of the four is lower than a year earlier, or has fallen two quarters running. Backlog "
+        "backlog at any of these companies is lower than a year earlier, or has fallen two quarters running. Backlog "
         "is work customers have signed for but not yet received. Much of it is reportedly computing power "
         "promised to OpenAI and Anthropic, like OpenAI's $300B deal with Oracle, so a lasting fall can mean "
         "those deals are being cut back. CoreWeave's backlog also secures its GPU loans. One quarter's dip "
@@ -1690,10 +1729,72 @@ def pct_text(p):
     return f"{p * 100:.0f}%" if p >= 0.095 else f"{p * 100:.1f}%"
 
 
+@functools.lru_cache(maxsize=None)
+def cds_data():
+    """cds_signal.series for every company it prices, computed once per run."""
+    return cds_signal.series(TODAY, download=not CACHED)
+
+
+def implied_notch(bp):
+    """Index in NOTCHES of the rating whose typical five-year spread bp matches."""
+    for i in range(len(NOTCH_MEDIANS) - 1):
+        if bp <= math.sqrt(NOTCH_MEDIANS[i] * NOTCH_MEDIANS[i + 1]):
+            return i
+    return len(NOTCH_MEDIANS) - 1
+
+
+def block_cds_ratings():
+    if (TODAY - AGENCY_AS_OF).days > AGENCY_STALE_DAYS:
+        warn(f"The agency ratings in the market-implied ratings table are from {day(AGENCY_AS_OF)}. Check them "
+             "and update AGENCY_RATINGS.")
+    data = cds_data()
+    bp = lambda p: cds_signal.par_spread(-math.log(1 - p) / cds_signal.HORIZON) * 1e4
+    month_no = lambda d: d.year * 12 + d.month
+    rows, gaps, fallen, missing = [], [], [], []
+    for ticker, (name, agency) in AGENCY_RATINGS.items():
+        have = [m for m in data.get(ticker, ([],))[0] if m.median is not None and not m.unresolved]
+        if not have or month_no(TODAY) - month_no(have[-1].month) > 1:
+            missing.append(name)
+            rows.append([name, "no recent trades", "n/a", agency, "n/a", "n/a"])
+            continue
+        m = have[-1]
+        spread = bp(m.median)
+        a, n = NOTCHES.index(agency), implied_notch(spread)
+        gaps.append(n - a)
+        if a <= NOTCHES.index("BBB-") < n:
+            fallen.append(name)
+        gap = f"{n - a} below" if n > a else f"{a - n} above" if a > n else "none"
+        rows.append([name, f"{spread:,.0f}bp in {m.month:%b}", pct_text(m.median), agency,
+                     f'<span class="bad">{NOTCHES[n]}</span>' if a <= 9 < n else NOTCHES[n], gap])
+    avg = st.mean(gaps) if gaps else None
+    out = table(["Company", "Five-year spread, latest month", "Chance of default in five years", "Agency rating",
+                 "Rating its spread trades like", "Notches below"], rows)
+    out += line(
+        f"the companies behind the AI build trade, on average, {NOTCH_GAP_LINE} or more notches below their "
+        f'agency ratings. Groundbreaker\'s <a href="{MARK_TO_SWAP_URL}">Mark to Swap</a> matches each company\'s '
+        "five-year spread to the rating whose typical spread is the same, the way Moody's builds its "
+        "market-implied ratings, and finds them about five notches below their ratings while the broad "
+        "investment-grade index trades a little above its own. Wall Street's broker-dealers were 4.6 notches "
+        "below in February 2007 and 6.5 by July, with their ratings unchanged. Investment grade ends at about "
+        "135bp, and a company rated investment grade that trades beyond it risks a downgrade that would force "
+        "insurers and funds to sell its debt or hold much more capital against it.",
+        None if avg is None else avg >= NOTCH_GAP_LINE,
+        (f"The {len(gaps)} companies with recent trades average {avg:.1f} notches below their agency ratings."
+         if avg is not None else "")
+        + (f" {and_list(fallen)} {'is' if len(fallen) == 1 else 'are'} rated investment grade but "
+           f"{'trades' if len(fallen) == 1 else 'trade'} as high yield." if fallen else "")
+        + (f" {and_list(missing)} {'has' if len(missing) == 1 else 'have'} no recent trades." if missing else ""))
+    out += (f'<p class="muted">Spreads are this page\'s own estimates from DTCC trades, worked out as in the '
+            f"section above. The agency ratings are as of {day(AGENCY_AS_OF)}, from Groundbreaker's table, and "
+            "nothing here updates them, so a downgrade shows up in the news section first. The typical spread "
+            "for each rating is Groundbreaker's.</p>")
+    return out + source("DTCC public swap data, with ratings from Groundbreaker", MARK_TO_SWAP_URL)
+
+
 def block_cds():
     today = TODAY
     start = today - timedelta(days=cds_signal.WINDOW_DAYS)
-    data = cds_signal.series(today, download=not CACHED)
+    data = {t: v for t, v in cds_data().items() if t in dict(CDS_NAMES)}
     reported, problem = reported_levels()
     to_pd = cds_signal.pd_from_spread
     # one probability scale for all three, so they can be compared
@@ -1921,6 +2022,21 @@ HEADLINE_FEEDS = [  # id, title, Google News searches, what the model flags, why
      "or had its assets seized, or a company has written down AI chips or shortened how long it expects "
      "them to last. John Hempton's argument is that once supply outruns demand, prices fall toward running "
      "costs and owners who borrowed to build can't pay."),
+    ("H", "News of lenders pulling back from data centers",
+     ['"data center" (loan OR loans OR CMBS OR ABS OR bonds) ("below par" OR "cents on the dollar" OR '
+      '"struggle to sell" OR "pull back" OR "pulls back" OR "pulled back") when:30d',
+      '(Fluidstack OR Nscale OR "Lambda Labs" OR Crusoe OR "Related Digital" OR Lancium) (default OR '
+      '"missed payment" OR delay OR dispute OR renegotiate OR "force majeure" OR layoffs) when:30d'],
+     "banks or investors pulling back from data center loans or bonds; a data center loan or bond being sold "
+     "or quoted well below face value; a data center financing being pulled or priced at a much higher "
+     "yield; or a company that stands between the AI labs and their landlords, such as Fluidstack, Nscale, "
+     "Lambda or Crusoe, missing a payment, delaying projects or struggling to raise money",
+     "a story says banks or investors are pulling back from data center loans, a data center loan or bond is "
+     "sold or quoted well below face value, a financing is pulled or has to pay much more, or a middleman "
+     "between the AI labs and their landlords, such as Fluidstack, Nscale, Lambda or Crusoe, misses a "
+     f'payment or struggles to raise money. <a href="{MARK_TO_SWAP_URL}">Groundbreaker</a> argues that the '
+     "build can only grow as fast as lenders will finance it, and that these middlemen are the first to "
+     "fail when a lab cuts back."),
 ]
 FEEDS = {f[0]: f for f in HEADLINE_FEEDS}
 
@@ -2685,6 +2801,7 @@ def block_news():
 SECTIONS = [
     ("1. Credit", [
         ("Corporate bond spreads", block_spreads),
+        ("Market-implied ratings", block_cds_ratings),
         ("Default risk from credit default swaps", block_cds),
         ("Share prices of heavily indebted AI companies", block_weak_borrowers),
     ]),
@@ -2692,8 +2809,8 @@ SECTIONS = [
         ("Big tech's capital spending and free cash flow", block_hyperscalers),
         ("Revenue against capital spending", block_payback),
         ("Nvidia's revenue and receivables", block_nvidia),
-        ("Nvidia's stakes in and guarantees for other companies", block_nvidia_financing),
-        ("Contract backlog at Oracle, Microsoft, Alphabet and CoreWeave", block_backlog),
+        ("Stakes in and guarantees for other companies", block_nvidia_financing),
+        ("Contract backlog at Oracle, Microsoft, Alphabet, Broadcom and CoreWeave", block_backlog),
         ("Commitments not on the balance sheet", block_commitments),
     ]),
     ("3. Computing power", [
@@ -2809,10 +2926,10 @@ def main():
         "<h1>AI Bubble Watch</h1>",
         f'<p class="muted">This page tracks signs that the AI boom is turning into a bust, using free public '
         f"data. It was last updated {generated}. Each signal has its own warning line, and there's no overall "
-        "score.</p>",
-        '<p class="muted">It draws on Ares\'s <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
+        "score. "
+        'It draws on Ares\'s <a href="https://www.ares.com/content/dam/aresmgmt/Documents/In-the-Gaps/'
         'Ares_InTheGaps_Newsletter_Fall-2026.pdf">In the Gaps</a> newsletter, '
-        '<a href="https://www.groundbrkr.com/t/ai">Groundbreaker</a> and John Hempton\'s interview '
+        '<a href="https://www.groundbrkr.com/t/ai">Groundbreaker\'s articles on AI</a> and John Hempton\'s interview '
         f'<a href="{HEMPTON_URL}">Why Data Centres Will Change the World and Bankrupt Their Builders</a>. '
         "Hempton's point is that computing power is expensive to build, cheap to run and much the same whoever "
         "sells it, so like fiber optics around 2000 it can change the world and still bankrupt its builders.</p>",
