@@ -1753,19 +1753,22 @@ def block_cds_ratings():
     rows, gaps, fallen, missing = [], [], [], []
     for ticker, (name, agency) in AGENCY_RATINGS.items():
         have = [m for m in data.get(ticker, ([],))[0] if m.median is not None and not m.unresolved]
-        if not have or month_no(TODAY) - month_no(have[-1].month) > 1:
+        full = [m for m in have if m.days >= cds_signal.MIN_DAYS]  # early in a month, use the month before
+        m = full[-1] if full else have[-1] if have else None
+        if not m or month_no(TODAY) - month_no(m.month) > 1:
             missing.append(name)
             rows.append([name, "no recent trades", "n/a", agency, "n/a", "n/a"])
             continue
-        m = have[-1]
         spread = bp(m.median)
         a, n = NOTCHES.index(agency), implied_notch(spread)
         gaps.append(n - a)
-        if a <= NOTCHES.index("BBB-") < n:
+        # Listed only a full notch inside high yield, so a name on the line doesn't flip between runs.
+        deep = a <= NOTCHES.index("BBB-") and n >= NOTCHES.index("BB")
+        if deep:
             fallen.append(name)
         gap = f"{n - a} below" if n > a else f"{a - n} above" if a > n else "none"
         rows.append([name, f"{spread:,.0f}bp in {m.month:%b}", pct_text(m.median), agency,
-                     f'<span class="bad">{NOTCHES[n]}</span>' if a <= 9 < n else NOTCHES[n], gap])
+                     f'<span class="bad">{NOTCHES[n]}</span>' if deep else NOTCHES[n], gap])
     avg = st.mean(gaps) if gaps else None
     out = table(["Company", "Five-year spread, latest month", "Chance of default in five years", "Agency rating",
                  "Rating its spread trades like", "Notches below"], rows)
@@ -1782,7 +1785,7 @@ def block_cds_ratings():
         (f"The {len(gaps)} companies with recent trades average {avg:.1f} notches below their agency ratings."
          if avg is not None else "")
         + (f" {and_list(fallen)} {'is' if len(fallen) == 1 else 'are'} rated investment grade but "
-           f"{'trades' if len(fallen) == 1 else 'trade'} as high yield." if fallen else "")
+           f"{'trades' if len(fallen) == 1 else 'trade'} at BB or worse." if fallen else "")
         + (f" {and_list(missing)} {'has' if len(missing) == 1 else 'have'} no recent trades." if missing else ""))
     out += (f'<p class="muted">Spreads are this page\'s own estimates from DTCC trades, worked out as in the '
             f"section above. The agency ratings are as of {day(AGENCY_AS_OF)}, from Groundbreaker's table, and "
@@ -1869,8 +1872,8 @@ def block_cds():
         "default swaps pay for protection. It's a market price that includes a premium for risk, so the real "
         f"chance is probably lower. It assumes lenders get back {cds_signal.R:.0%} of what they're owed, and a "
         "lower recovery would mean a lower chance. " + accuracy +
-        "Worry if it climbs for several months running, especially if CoreWeave and Oracle climb while Nvidia "
-        "stays flat. That would point to a problem with how AI is financed while chip demand holds up.")
+        "Worry if it climbs for several months running, especially if CoreWeave and Oracle climb together. "
+        "Nvidia's spread now also moves with the leases it guarantees, so it no longer shows chip demand alone.")
     if problem:
         out += f'<p class="error">{esc(problem)}</p>'
     return out + (
@@ -2801,8 +2804,8 @@ def block_news():
 SECTIONS = [
     ("1. Credit", [
         ("Corporate bond spreads", block_spreads),
-        ("Market-implied ratings", block_cds_ratings),
         ("Default risk from credit default swaps", block_cds),
+        ("Market-implied ratings", block_cds_ratings),
         ("Share prices of heavily indebted AI companies", block_weak_borrowers),
     ]),
     ("2. Spending and income", [

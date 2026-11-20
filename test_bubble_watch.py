@@ -752,13 +752,18 @@ class MarketImpliedRatings(unittest.TestCase):
         page, _ = self.page({"MSFT": 48, "META": 112, "ORCL": 316, "CRWV": 1145})
         self.assertIn("a warning today", page)
         self.assertIn("4 companies with recent trades average 4.8 notches below", page)
-        self.assertIn("Oracle is rated investment grade but trades as high yield", page)
+        self.assertIn("Oracle is rated investment grade but trades at BB or worse", page)
         self.assertIn("Alphabet, Amazon, Nvidia, AMD, Broadcom and SpaceX have no recent trades", page)
 
     def test_spreads_in_line_with_ratings_do_not(self):
         page, _ = self.page({"MSFT": 20, "ORCL": 120})
         self.assertIn("no warning today", page)
         self.assertIn("<td>none</td>", page)
+
+    def test_a_name_just_past_the_line_is_not_listed(self):
+        page, _ = self.page({"NVDA": 136, "ORCL": 316})
+        self.assertIn(" Oracle is rated investment grade but trades at BB or worse.", page)
+        self.assertNotIn("Nvidia is rated", page)
 
     def test_old_ratings_are_flagged(self):
         _, warnings = self.page({"MSFT": 48}, today=date(2027, 6, 1))
